@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""
+SQL Attribute Tracer - Generic CTE and Subquery Version
+"""
+
+import re
+import sys
+
+# List of SQL keywords and literals to exclude
+SQL_KEYWORDS = {'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AND', 'OR', 'NOT', 'DESC', 'ASC', 'TOP', 'ABOVE', 'AVERAGE', 'BELOW', 'PERFORMER', 'MID', 'LEVEL', 'DEVELOPING', 'NO', 'SALES', 'RECORDED', 'TOP'}
+
+def extract_all_column_references(sql_text):
+    """Extract all column references from the entire SQL query."""
+    # Clean SQL
+    sql_text = re.sub(r'--.*$', '', sql_text, flags=re.MULTILINE)
+    sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
+    sql_text = ' '.join(sql_text.split())
+
+    # Extract CTE names
+    cte_names = extract_cte_names(sql_text)
+    print(f"CTE names: {cte_names}")  # Debug
+
+    # Extract all table references, aliases, and subqueries
+    table_sources, all_aliases = extract_all_table_sources_and_aliases(sql_text, cte_names)
+    print(f"Table sources: {table_sources}")  # Debug
+    print(f"All aliases: {all_aliases}")  # Debug
+
+    # Extract final table aliases from the main query
+    final_aliases = extract_final_table_aliases(sql_text, cte_names)
+    print(f"Final aliases: {final_aliases}")  # Debug
+
+    # Extract final SELECT clause
+    final_select = extract_final_select(sql_text)
+    print(f"Final select: {final_select}")  # Debug
+
+    # Extract all column references from the final SELECT
+    all_column_refs = extract_all_column_references_from_select(final_select, final_aliases)
+    print(f"Column refs: {all_column_refs}")  # Debug
+
+    results = []
+    seen_columns = set()
+
+    for column_ref in all_column_refs:
+        column_name = column_ref['column']
+        table_alias = column_ref['alias']
+        is_derived = column_ref.get('is_derived', False)
+        source_type = column_ref.get('source_type', 'table')
+
+        # Trace the column to its ultimate source(s)
+        source_mappings = trace_column_to_all_sources(column_name, table_alias, sql_text, final_aliases, table_sources, cte_names)
+        print(f"Tracing {column_name} (alias: {table_alias}) -> {source_mappings}")  # Debug
+
+        for source_table, source_column in source_mappings:
+            if (column_name, source_table, source_column) not in seen_columns:
+                seen_columns.add((column_name, source_table, source_column))
+                output = f"{source_table} ({source_column})"
+                if is_derived and source_type == 'subquery':
+                    output += " (Derived in Subquery)"
+                elif is_derived and (source_table in cte_names or column_name == source_column):
+                    output += " (Derived in CTE)"
+                results.append((column_name, output))
+
+    return sorted(results, key=lambda x: x[0])  # Sort by attribute name for consistent output
+
+
+def extract_cte_names(sql_text):
+    """Extract all CTE names from the WITH clause."""
+    cte_names = []
+    if 'WITH' not in sql_text.upper():
+        return cte_names
+    with_match = re.search(r'WITH\s+(.+?)(?=\s*(?:SELECT|WITH)\b)', sql_text, re.IGNORECASE | re.DOTALL)
+    if with_match:
+        with_clause = with_match.group(1)
+        cte_definitions = []
+        current = ""
+        paren_depth = 0
+        for char in with_clause:
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth -= 1
+            elif char == ',' and paren_depth == 0:
+                if current.strip():
+                    cte_definitions.append(current.strip())
+                current = ""
+                continue
+            current += char
+        if current.strip():
+            cte_definitions.append(current.strip())
+        for cte_def in cte_definitions:
+            match = re.match(r'\s*(\w+)\s*AS\s*\(', cte_def, re.IGNORECASE)
+            if match:
+                cte_names.append(match.group(1))
+    return cte_names
+
+
+def extract_all_table_sources_and_aliases(sql_text, cte_names):
+    """Extract all table sources, aliases, and subqueries from the query."""
+    sources = {}
+    all_aliases = {}
+    
+    # Extract FROM and JOIN clauses with schema-qualified table names and subqueries
+    from_matches = re.findall(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', sql_text, re.IGNORECASE | re.DOTALL)
+    join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=ON|WHERE|GROUP|ORDER|;|$)', sql_text, re.IGNORECASE | re.DOTALL)
+    
+    for match in from_matches + join_matches:
+        schema, table_name, alias, subquery, subquery_alias = match
+        if table_name:
+            full_table_name = f"{schema}.{table_name}" if schema else table_name
+            sources[table_name] = full_table_name
+            if alias and alias.upper() not in {'WHERE', 'ON', 'GROUP', 'ORDER', 'BY'}:
+                all_aliases[alias] = full_table_name
+        elif subquery and subquery_alias:
+            sources[subquery_alias] = subquery_alias
+            all_aliases[subquery_alias] = subquery_alias
+    
+    # Include CTEs in sources
+    for cte_name in cte_names:
+        sources[cte_name] = cte_name
+        all_aliases[cte_name] = cte_name
+
+    return sources, all_aliases
+
+
+def extract_final_table_aliases(sql_text, cte_names):
+    """Extract table aliases from the final FROM clause of the main query."""
+    aliases = {}
+    
+    if 'WITH' not in sql_text.upper():
+        from_match = re.search(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', sql_text, re.IGNORECASE | re.DOTALL)
+        if from_match:
+            schema, table_name, alias, subquery, subquery_alias = from_match.groups()
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                if alias and alias.upper() not in {'WHERE', 'ON', 'GROUP', 'ORDER', 'BY'}:
+                    aliases[alias] = full_table_name
+                else:
+                    aliases[table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+
+        join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=ON|WHERE|GROUP|ORDER|;|$)', sql_text, re.IGNORECASE | re.DOTALL)
+        for schema, table_name, alias, subquery, subquery_alias in join_matches:
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                if alias and alias.upper() not in {'WHERE', 'ON', 'GROUP', 'ORDER', 'BY'}:
+                    aliases[alias] = full_table_name
+                elif not alias:
+                    aliases[table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+
+        return aliases
+
+    from_matches = []
+    paren_depth = 0
+    pos = 0
+    while pos < len(sql_text):
+        if sql_text[pos] == '(':
+            paren_depth += 1
+        elif sql_text[pos] == ')':
+            paren_depth -= 1
+        elif sql_text[pos:pos+4].upper() == 'FROM' and paren_depth == 0:
+            from_matches.append(pos)
+        pos += 1
+
+    if from_matches:
+        last_from_pos = from_matches[-1]
+        from_clause = sql_text[last_from_pos:]
+        from_match = re.search(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', from_clause, re.IGNORECASE | re.DOTALL)
+        if from_match:
+            schema, table_name, alias, subquery, subquery_alias = from_match.groups()
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                if alias and alias.upper() not in {'WHERE', 'ON', 'GROUP', 'ORDER', 'BY'}:
+                    aliases[alias] = full_table_name
+                else:
+                    aliases[table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+
+        join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=ON|WHERE|GROUP|ORDER|;|$)', from_clause, re.IGNORECASE | re.DOTALL)
+        for schema, table_name, alias, subquery, subquery_alias in join_matches:
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                if alias and alias.upper() not in {'WHERE', 'ON', 'GROUP', 'ORDER', 'BY'}:
+                    aliases[alias] = full_table_name
+                elif not alias:
+                    aliases[table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+
+    return aliases
+
+
+def extract_all_column_references_from_select(select_clause, final_aliases):
+    """Extract all column references from SELECT clause, including CASE expressions and subqueries."""
+    column_refs = []
+    seen_columns = set()
+
+    expressions = split_select_expressions(select_clause)
+
+    for expr in expressions:
+        expr = expr.strip()
+        if 'CASE' in expr.upper():
+            parts = re.split(r'\s+AS\s+', expr, flags=re.IGNORECASE)
+            as_name = parts[1].strip() if len(parts) == 2 else None
+            if as_name and as_name.upper() not in SQL_KEYWORDS:
+                underlying_cols = extract_columns_from_expression(expr, final_aliases)
+                if (None, as_name) not in seen_columns:
+                    column_refs.append({'alias': None, 'column': as_name, 'is_derived': True, 'source_type': 'cte'})
+                    seen_columns.add((None, as_name))
+                    for col, alias in underlying_cols:
+                        if (alias, col) not in seen_columns:
+                            column_refs.append({'alias': alias, 'column': col, 'source_type': 'table'})
+                            seen_columns.add((alias, col))
+            continue
+
+        simple_match = re.match(r'^\s*(\w+)\.(\w+)\s*$', expr, re.IGNORECASE)
+        if simple_match:
+            alias, column = simple_match.groups()
+            if alias.upper() not in SQL_KEYWORDS and column.upper() not in SQL_KEYWORDS:
+                source_type = 'subquery' if alias in final_aliases and final_aliases[alias] == alias else 'table'
+                is_derived = source_type == 'subquery'
+                if (alias, column) not in seen_columns:
+                    column_refs.append({'alias': alias, 'column': column, 'source_type': source_type, 'is_derived': is_derived})
+                    seen_columns.add((alias, column))
+            continue
+
+        if ' AS ' in expr.upper():
+            parts = re.split(r'\s+AS\s+', expr, flags=re.IGNORECASE)
+            source_expr = parts[0].strip()
+            as_name = parts[1].strip()
+            simple_match = re.match(r'^(\w+)\.(\w+)$', source_expr, re.IGNORECASE)
+            if simple_match:
+                alias, column = simple_match.groups()
+                if alias.upper() not in SQL_KEYWORDS and column.upper() not in SQL_KEYWORDS:
+                    source_type = 'subquery' if alias in final_aliases and final_aliases[alias] == alias else 'table'
+                    is_derived = source_type == 'subquery'
+                    if (alias, column) not in seen_columns:
+                        column_refs.append({'alias': alias, 'column': column, 'source_type': source_type, 'is_derived': is_derived})
+                        seen_columns.add((alias, column))
+            else:
+                if as_name.upper() not in SQL_KEYWORDS and (None, as_name) not in seen_columns:
+                    column_refs.append({'alias': None, 'column': as_name, 'is_derived': True, 'source_type': 'cte'})
+                    seen_columns.add((None, as_name))
+        else:
+            simple_match = re.match(r'^\s*(\w+)\s*$', expr, re.IGNORECASE)
+            if simple_match:
+                column = simple_match.group(1)
+                if column.upper() not in SQL_KEYWORDS and (None, column) not in seen_columns:
+                    column_refs.append({'alias': None, 'column': column, 'source_type': 'table', 'is_derived': False})
+                    seen_columns.add((None, column))
+
+    return column_refs
+
+
+def split_select_expressions(select_clause):
+    """Split SELECT clause into individual expressions, respecting parentheses."""
+    expressions = []
+    current = ""
+    depth = 0
+
+    for char in select_clause + ",":
+        if char == '(':
+            depth += 1
+            current += char
+        elif char == ')':
+            depth -= 1
+            current += char
+        elif char == ',' and depth == 0:
+            if current.strip():
+                expressions.append(current.strip())
+            current = ""
+        else:
+            current += char
+
+    if current.strip() and depth == 0:
+        expressions.append(current.strip())
+
+    return expressions
+
+
+def find_underlying_source_columns(column_name, source_name, sql_text, cte_names=None):
+    """Find base columns and their aliases for a column in a CTE, subquery, or main query."""
+    if cte_names is None:
+        cte_names = extract_cte_names(sql_text)
+
+    if source_name == "main_query":
+        select_clause = extract_final_select(sql_text)
+        aliases = extract_final_table_aliases(sql_text, cte_names)
+        print(f"Main query select clause: {select_clause}")  # Debug
+        print(f"Main query aliases: {aliases}")  # Debug
+
+        for expr in split_select_expressions(select_clause):
+            expr = expr.strip()
+            print(f"Checking expr for {column_name} in main query: {expr}")  # Debug
+            if re.search(rf'\bAS\s+{re.escape(column_name)}\s*$', expr, re.IGNORECASE):
+                underlying_cols = extract_columns_from_expression(expr, aliases)
+                print(f"Found underlying cols for {column_name} in main query: {underlying_cols}")  # Debug
+                return underlying_cols
+        return []
+
+    # Check if source_name is a CTE
+    cte_start = sql_text.upper().find(source_name.upper() + ' AS')
+    if cte_start != -1:
+        paren_start = sql_text.find('(', cte_start)
+        if paren_start == -1:
+            print(f"Invalid CTE syntax for {source_name}")  # Debug
+            return []
+
+        paren_count = 1
+        pos = paren_start + 1
+        while pos < len(sql_text) and paren_count > 0:
+            if sql_text[pos] == '(':
+                paren_count += 1
+            elif sql_text[pos] == ')':
+                paren_count -= 1
+            pos += 1
+
+        if paren_count > 0:
+            print(f"Unclosed parentheses in CTE {source_name}")  # Debug
+            return []
+
+        cte_body = sql_text[paren_start + 1:pos - 1]
+        select_match = re.search(r'SELECT\s+(.*?)(?=\s+FROM)', cte_body, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            print(f"No SELECT clause found in CTE {source_name}")  # Debug
+            return []
+        select_clause = select_match.group(1)
+        print(f"CTE {source_name} select clause: {select_clause}")  # Debug
+
+        aliases = {}
+        from_match = re.search(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', cte_body, re.IGNORECASE | re.DOTALL)
+        if from_match:
+            schema, table_name, alias, subquery, subquery_alias = from_match.groups()
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                aliases[alias or table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+
+        join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=ON|WHERE|GROUP|ORDER|;|$)', cte_body, re.IGNORECASE | re.DOTALL)
+        for schema, table_name, alias, subquery, subquery_alias in join_matches:
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                aliases[alias or table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+        print(f"CTE {source_name} aliases: {aliases}")  # Debug
+
+        for expr in split_select_expressions(select_clause):
+            expr = expr.strip()
+            print(f"Checking expr for {column_name}: {expr}")  # Debug
+            if re.search(rf'\bAS\s+{re.escape(column_name)}\s*$', expr, re.IGNORECASE):
+                underlying_cols = extract_columns_from_expression(expr, aliases)
+                print(f"Found underlying cols for {column_name}: {underlying_cols}")  # Debug
+                return underlying_cols
+            direct_match = re.match(r'^\s*(\w+)\.(\w+)\s*$', expr, re.IGNORECASE)
+            if direct_match:
+                alias, col = direct_match.groups()
+                if col.lower() == column_name.lower() and alias in aliases:
+                    print(f"Matched direct column {col} with alias {alias} for {column_name}")  # Debug
+                    return [(col, alias)]
+            unqualified_match = re.match(r'^\s*(\w+)\s*$', expr, re.IGNORECASE)
+            if unqualified_match:
+                col = unqualified_match.group(1)
+                if col.lower() == column_name.lower() and len(aliases) == 1:
+                    alias = list(aliases.keys())[0]
+                    print(f"Matched unqualified column {col} with alias {alias} for {column_name}")  # Debug
+                    return [(col, alias)]
+
+        print(f"No matching expression found for {column_name} in CTE {source_name}")  # Debug
+        return []
+
+    # Check if source_name is a subquery
+    subquery_match = re.search(rf'\((.*?)\)\s*(?:AS\s+)?{re.escape(source_name)}\b', sql_text, re.IGNORECASE | re.DOTALL)
+    if subquery_match:
+        subquery_body = subquery_match.group(1)
+        select_match = re.search(r'SELECT\s+(.*?)(?=\s+FROM)', subquery_body, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            print(f"No SELECT clause found in subquery {source_name}")  # Debug
+            return []
+        select_clause = select_match.group(1)
+        print(f"Subquery {source_name} select clause: {select_clause}")  # Debug
+
+        aliases = {}
+        from_match = re.search(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?)\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', subquery_body, re.IGNORECASE)
+        if from_match:
+            schema, table_name, alias = from_match.groups()
+            full_table_name = f"{schema}.{table_name}" if schema else table_name
+            aliases[alias or table_name] = full_table_name
+
+        join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?)\s*(?=ON|WHERE|GROUP|ORDER|;|$)', subquery_body, re.IGNORECASE)
+        for schema, table_name, alias in join_matches:
+            full_table_name = f"{schema}.{table_name}" if schema else table_name
+            aliases[alias or table_name] = full_table_name
+        print(f"Subquery {source_name} aliases: {aliases}")  # Debug
+
+        for expr in split_select_expressions(select_clause):
+            expr = expr.strip()
+            print(f"Checking expr for {column_name}: {expr}")  # Debug
+            if re.search(rf'\bAS\s+{re.escape(column_name)}\s*$', expr, re.IGNORECASE):
+                underlying_cols = extract_columns_from_expression(expr, aliases)
+                print(f"Found underlying cols for {column_name}: {underlying_cols}")  # Debug
+                return underlying_cols
+            direct_match = re.match(r'^\s*(\w+)\.(\w+)\s*$', expr, re.IGNORECASE)
+            if direct_match:
+                alias, col = direct_match.groups()
+                if col.lower() == column_name.lower() and alias in aliases:
+                    print(f"Matched direct column {col} with alias {alias} for {column_name}")  # Debug
+                    return [(col, alias)]
+            unqualified_match = re.match(r'^\s*(\w+)\s*$', expr, re.IGNORECASE)
+            if unqualified_match:
+                col = unqualified_match.group(1)
+                if col.lower() == column_name.lower() and len(aliases) == 1:
+                    alias = list(aliases.keys())[0]
+                    print(f"Matched unqualified column {col} with alias {alias} for {column_name}")  # Debug
+                    return [(col, alias)]
+
+        print(f"No matching expression found for {column_name} in subquery {source_name}")  # Debug
+        return []
+
+    print(f"Source {source_name} not found")  # Debug
+    return []
+
+
+def extract_columns_from_expression(expression, aliases=None):
+    """Extract base column names and their aliases from an expression."""
+    if aliases is None:
+        aliases = {}
+
+    columns = []
+    if ' AS ' in expression.upper():
+        parts = re.split(r'\s+AS\s+', expression, flags=re.IGNORECASE)
+        expression = parts[0].strip()
+    print(f"Extracting columns from expression: {expression}")  # Debug
+
+    if 'CASE' in expression.upper():
+        no_strings = re.sub(r'\'[^\']*\'', '', expression)
+        case_columns = re.findall(r'\b(\w+)\.(\w+)\b|\b(\w+)\b(?!\s*\.\s*\w+)', no_strings, re.IGNORECASE)
+        for match in case_columns:
+            if match[0]:
+                alias, column = match[0], match[1]
+                if (alias.upper() not in SQL_KEYWORDS and 
+                    column.upper() not in SQL_KEYWORDS and 
+                    not column.isdigit() and 
+                    alias in aliases):
+                    columns.append((column, alias))
+            elif match[2]:
+                column = match[2]
+                if (column.upper() not in SQL_KEYWORDS and 
+                    not column.isdigit() and 
+                    len(aliases) == 1):
+                    alias = list(aliases.keys())[0]
+                    columns.append((column, alias))
+        print(f"Matched CASE columns: {columns}")  # Debug
+        return list(set(columns))
+
+    row_number_match = re.search(r'ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*ORDER\s+BY\s+(.+?)\s*\)', expression, re.IGNORECASE)
+    if row_number_match:
+        order_by_clause = row_number_match.group(1)
+        order_by_columns = re.findall(r'\b(\w+)\.(\w+)\b|\b(\w+)\b(?!\s*\.\s*\w+)', order_by_clause, re.IGNORECASE)
+        for match in order_by_columns:
+            if match[0]:
+                alias, column = match[0], match[1]
+                if (alias.upper() not in SQL_KEYWORDS and 
+                    column.upper() not in SQL_KEYWORDS and 
+                    not column.isdigit() and 
+                    alias in aliases):
+                    columns.append((column, alias))
+            elif match[2]:
+                column = match[2]
+                if (column.upper() not in SQL_KEYWORDS and 
+                    not column.isdigit() and 
+                    len(aliases) == 1):
+                    alias = list(aliases.keys())[0]
+                    columns.append((column, alias))
+        print(f"Matched ROW_NUMBER columns: {columns}")  # Debug
+        return list(set(columns))
+
+    date_trunc_match = re.search(r'DATE_TRUNC\s*\(\s*\'\w+\'\s*,\s*(\w+)\.(\w+)\s*\)', expression, re.IGNORECASE)
+    if date_trunc_match:
+        alias, column = date_trunc_match.groups()
+        print(f"Matched DATE_TRUNC: alias={alias}, column={column}")  # Debug
+        return [(column, alias)]
+
+    agg_match = re.search(r'(COUNT|SUM|AVG|MAX|MIN)\s*\(\s*(?:DISTINCT\s+)?(?:(\w+)\.)?(\w+)\s*([\*\/+\-]\s*(?:(\w+)\.)?(\w+))?\s*\)\s*(?:AS\s+\w+)?', expression, re.IGNORECASE)
+    if agg_match and 'CASE' not in expression.upper():
+        alias1, column1 = agg_match.group(2), agg_match.group(3)
+        if alias1 is None and len(aliases) == 1:
+            alias1 = list(aliases.keys())[0]
+        print(f"Matched aggregate: alias1={alias1}, column1={column1}")  # Debug
+        if alias1 and column1.upper() not in SQL_KEYWORDS and not column1.isdigit():
+            columns.append((column1, alias1))
+        if agg_match.group(4):
+            alias2, column2 = agg_match.group(5), agg_match.group(6)
+            if alias2 is None and len(aliases) == 1:
+                alias2 = list(aliases.keys())[0]
+            print(f"Matched aggregate second column: alias2={alias2}, column2={column2}")  # Debug
+            if alias2 and column2.upper() not in SQL_KEYWORDS and not column2.isdigit():
+                columns.append((column2, alias2))
+        return list(set(columns))
+
+    arith_match = re.findall(r'\b(\w+)\.(\w+)\s*[\*\/+\-]\s*(\w+)\.(\w+)\b', expression, re.IGNORECASE)
+    if arith_match:
+        for alias1, col1, alias2, col2 in arith_match:
+            if col1.upper() not in SQL_KEYWORDS and not col1.isdigit():
+                columns.append((col1, alias1))
+            if col2.upper() not in SQL_KEYWORDS and not col2.isdigit():
+                columns.append((col2, alias2))
+        print(f"Matched arithmetic: {columns}")  # Debug
+        return list(set(columns))
+
+    direct_match = re.match(r'^\s*(\w+)\.(\w+)\s*$', expression, re.IGNORECASE)
+    if direct_match:
+        alias, column = direct_match.groups()
+        if column.upper() not in SQL_KEYWORDS and not column.isdigit():
+            print(f"Matched direct: alias={alias}, column={column}")  # Debug
+            return [(column, alias)]
+
+    print(f"No columns matched in expression: {expression}")  # Debug
+    return []
+
+
+def find_column_source_in_cte(column_name, source_name, sql_text, specific_alias=None, cte_names=None):
+    """Find the source table for a column within a specific CTE, subquery, or main query."""
+    if cte_names is None:
+        cte_names = extract_cte_names(sql_text)
+
+    if source_name == "main_query":
+        select_clause = extract_final_select(sql_text)
+        aliases = extract_final_table_aliases(sql_text, cte_names)
+        print(f"Main query select clause: {select_clause}")  # Debug
+        print(f"Main query aliases: {aliases}")  # Debug
+
+        for expr in split_select_expressions(select_clause):
+            expr = expr.strip()
+            print(f"Checking expr: {expr} for column {column_name} in main query")  # Debug
+            alias_match = re.match(r'^\s*(\w+)\.(\w+)\s*(?:AS\s+(\w+)\s*)?$', expr, re.IGNORECASE)
+            if alias_match:
+                alias, col, as_name = alias_match.groups()
+                as_name = as_name or col
+                print(f"Matched alias: {alias}, col: {col}, as_name: {as_name} for column_name: {column_name}")  # Debug
+                if alias in aliases and col.lower() == column_name.lower():
+                    return aliases[alias]
+                if alias in aliases and as_name.lower() == column_name.lower():
+                    return aliases[alias]
+            unqualified_match = re.match(r'^\s*(\w+)\s*$', expr, re.IGNORECASE)
+            if unqualified_match:
+                col = unqualified_match.group(1)
+                if col.lower() == column_name.lower() and len(aliases) == 1:
+                    alias = list(aliases.keys())[0]
+                    print(f"Matched unqualified column {col} with alias {alias} for {column_name}")  # Debug
+                    return aliases[alias]
+        print(f"No source found for {column_name} in main query")  # Debug
+        return None
+
+    cte_start = sql_text.upper().find(source_name.upper() + ' AS')
+    if cte_start != -1:
+        paren_start = sql_text.find('(', cte_start)
+        if paren_start == -1:
+            print(f"Invalid CTE syntax for {source_name}")  # Debug
+            return None
+
+        paren_count = 1
+        pos = paren_start + 1
+        while pos < len(sql_text) and paren_count > 0:
+            if sql_text[pos] == '(':
+                paren_count += 1
+            elif sql_text[pos] == ')':
+                paren_count -= 1
+            pos += 1
+
+        if paren_count > 0:
+            print(f"Unclosed parentheses in CTE {source_name}")  # Debug
+            return None
+
+        cte_body = sql_text[paren_start + 1:pos - 1]
+        select_match = re.search(r'SELECT\s+(.*?)(?=\s+FROM)', cte_body, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            print(f"No SELECT clause found in CTE {source_name}")  # Debug
+            return None
+        select_clause = select_match.group(1)
+        print(f"CTE {source_name} select clause: {select_clause}")  # Debug
+
+        aliases = {}
+        from_match = re.search(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', cte_body, re.IGNORECASE | re.DOTALL)
+        if from_match:
+            schema, table_name, alias, subquery, subquery_alias = from_match.groups()
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                aliases[alias or table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+
+        join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?|\((.*?)\)(?:\s+(?:AS\s+)?(\w+)))\s*(?=ON|WHERE|GROUP|ORDER|;|$)', cte_body, re.IGNORECASE | re.DOTALL)
+        for schema, table_name, alias, subquery, subquery_alias in join_matches:
+            if table_name:
+                full_table_name = f"{schema}.{table_name}" if schema else table_name
+                aliases[alias or table_name] = full_table_name
+            elif subquery and subquery_alias:
+                aliases[subquery_alias] = subquery_alias
+        print(f"CTE {source_name} aliases: {aliases}")  # Debug
+
+        if specific_alias and specific_alias in aliases:
+            print(f"Using specific alias {specific_alias} -> {aliases[specific_alias]}")  # Debug
+            return aliases[specific_alias]
+
+        for expr in split_select_expressions(select_clause):
+            expr = expr.strip()
+            print(f"Checking expr: {expr} for column {column_name}")  # Debug
+            alias_match = re.match(r'^\s*(\w+)\.(\w+)\s*(?:AS\s+(\w+)\s*)?$', expr, re.IGNORECASE)
+            if alias_match:
+                alias, col, as_name = alias_match.groups()
+                as_name = as_name or col
+                print(f"Matched alias: {alias}, col: {col}, as_name: {as_name} for column_name: {column_name}")  # Debug
+                if alias in aliases and col.lower() == column_name.lower():
+                    return aliases[alias]
+                if alias in aliases and as_name.lower() == column_name.lower():
+                    return aliases[alias]
+            unqualified_match = re.match(r'^\s*(\w+)\s*$', expr, re.IGNORECASE)
+            if unqualified_match:
+                col = unqualified_match.group(1)
+                if col.lower() == column_name.lower() and len(aliases) == 1:
+                    alias = list(aliases.keys())[0]
+                    print(f"Matched unqualified column {col} with alias {alias} for {column_name}")  # Debug
+                    return aliases[alias]
+
+        print(f"No source found for {column_name} in CTE {source_name}")  # Debug
+        return None
+
+    # Check if source_name is a subquery
+    subquery_match = re.search(rf'\((.*?)\)\s*(?:AS\s+)?{re.escape(source_name)}\b', sql_text, re.IGNORECASE | re.DOTALL)
+    if subquery_match:
+        subquery_body = subquery_match.group(1)
+        select_match = re.search(r'SELECT\s+(.*?)(?=\s+FROM)', subquery_body, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            print(f"No SELECT clause found in subquery {source_name}")  # Debug
+            return None
+        select_clause = select_match.group(1)
+        print(f"Subquery {source_name} select clause: {select_clause}")  # Debug
+
+        aliases = {}
+        from_match = re.search(r'FROM\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?)\s*(?=(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN|WHERE|GROUP|ORDER|;|$)', subquery_body, re.IGNORECASE)
+        if from_match:
+            schema, table_name, alias = from_match.groups()
+            full_table_name = f"{schema}.{table_name}" if schema else table_name
+            aliases[alias or table_name] = full_table_name
+
+        join_matches = re.findall(r'JOIN\s+(?:(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?)\s*(?=ON|WHERE|GROUP|ORDER|;|$)', subquery_body, re.IGNORECASE)
+        for schema, table_name, alias in join_matches:
+            full_table_name = f"{schema}.{table_name}" if schema else table_name
+            aliases[alias or table_name] = full_table_name
+        print(f"Subquery {source_name} aliases: {aliases}")  # Debug
+
+        if specific_alias and specific_alias in aliases:
+            print(f"Using specific alias {specific_alias} -> {aliases[specific_alias]}")  # Debug
+            return aliases[specific_alias]
+
+        for expr in split_select_expressions(select_clause):
+            expr = expr.strip()
+            print(f"Checking expr: {expr} for column {column_name}")  # Debug
+            alias_match = re.match(r'^\s*(\w+)\.(\w+)\s*(?:AS\s+(\w+)\s*)?$', expr, re.IGNORECASE)
+            if alias_match:
+                alias, col, as_name = alias_match.groups()
+                as_name = as_name or col
+                print(f"Matched alias: {alias}, col: {col}, as_name: {as_name} for column_name: {column_name}")  # Debug
+                if alias in aliases and col.lower() == column_name.lower():
+                    return aliases[alias]
+                if alias in aliases and as_name.lower() == column_name.lower():
+                    return aliases[alias]
+            unqualified_match = re.match(r'^\s*(\w+)\s*$', expr, re.IGNORECASE)
+            if unqualified_match:
+                col = unqualified_match.group(1)
+                if col.lower() == column_name.lower() and len(aliases) == 1:
+                    alias = list(aliases.keys())[0]
+                    print(f"Matched unqualified column {col} with alias {alias} for {column_name}")  # Debug
+                    return aliases[alias]
+
+        print(f"No source found for {column_name} in subquery {source_name}")  # Debug
+        return None
+
+    print(f"Source {source_name} not found")  # Debug
+    return None
+
+
+def trace_column_to_all_sources(column_name, table_alias, sql_text, final_aliases, table_sources, cte_names):
+    """Trace a column through CTEs and subqueries to all its ultimate source table(s) and column(s)."""
+    if 'WITH' not in sql_text.upper() and not any('(' in v for v in final_aliases.values()):
+        if table_alias and table_alias in final_aliases:
+            resolved_table = final_aliases[table_alias]
+            return [(resolved_table, column_name)]
+        resolved_table = list(final_aliases.values())[0] if final_aliases else "Unknown"
+        return [(resolved_table, column_name)]
+
+    if table_alias is None:
+        if len(final_aliases) == 1:
+            table_alias = list(final_aliases.keys())[0]
+        else:
+            print(f"Skipping invalid mapping for {column_name} with no table alias")  # Debug
+            return []
+
+    current_table = table_alias
+    if table_alias in final_aliases:
+        current_table = final_aliases[table_alias]
+    print(f"Current table for {column_name}: {current_table}")  # Debug
+
+    # Check if the source is a subquery
+    subquery_match = re.search(rf'\((.*?)\)\s*(?:AS\s+)?{re.escape(current_table)}\b', sql_text, re.IGNORECASE | re.DOTALL)
+    if subquery_match:
+        underlying_columns = find_underlying_source_columns(column_name, current_table, sql_text, cte_names)
+        if underlying_columns:
+            all_results = []
+            for col, alias in underlying_columns:
+                # If alias is None, use the single table from the subquery
+                if alias is None and len(extract_final_table_aliases(subquery_match.group(1), cte_names)) == 1:
+                    alias = list(extract_final_table_aliases(subquery_match.group(1), cte_names).keys())[0]
+                source_table = find_column_source_in_cte(col, current_table, sql_text, specific_alias=alias, cte_names=cte_names)
+                print(f"Resolved source table for {col} (alias {alias}): {source_table}")  # Debug
+                if source_table and source_table not in cte_names and source_table not in [k for k, v in table_sources.items() if v == k]:
+                    all_results.append((source_table, col))
+                else:
+                    # Recurse with the subquery's aliases
+                    subquery_body = subquery_match.group(1)
+                    sub_aliases = extract_final_table_aliases(subquery_body, cte_names)
+                    sub_results = trace_column_to_all_sources(col, alias, subquery_body, sub_aliases, table_sources, cte_names)
+                    all_results.extend(sub_results)
+            return all_results if all_results else [(trace_to_base_table(column_name, current_table, sql_text, cte_names), column_name)]
+        return [(trace_to_base_table(column_name, current_table, sql_text, cte_names), column_name)]
+
+    # Check if the column is defined in the main query
+    underlying_columns = find_underlying_source_columns(column_name, "main_query", sql_text)
+    if underlying_columns:
+        all_results = []
+        for col, alias in underlying_columns:
+            source_table = find_column_source_in_cte(col, current_table, sql_text, specific_alias=alias, cte_names=cte_names)
+            print(f"Resolved source table for {col} (alias {alias}) in main query: {source_table}")  # Debug
+            if source_table and source_table not in cte_names:
+                all_results.append((source_table, col))
+            else:
+                sub_results = trace_column_to_all_sources(col, alias, sql_text, {alias: source_table or current_table}, table_sources, cte_names)
+                all_results.extend(sub_results)
+        return all_results if all_results else [(trace_to_base_table(column_name, current_table, sql_text, cte_names), column_name)]
+
+    # Check the current CTE or table
+    underlying_columns = find_underlying_source_columns(column_name, current_table, sql_text)
+    print(f"Underlying columns for {column_name}: {underlying_columns}")  # Debug
+
+    if underlying_columns:
+        all_results = []
+        for col, alias in underlying_columns:
+            source_table = find_column_source_in_cte(col, current_table, sql_text, specific_alias=alias, cte_names=cte_names)
+            print(f"Resolved source table for {col} (alias {alias}): {source_table}")  # Debug
+            if source_table and source_table not in cte_names:
+                all_results.append((source_table, col))
+            else:
+                sub_results = trace_column_to_all_sources(col, alias, sql_text, {alias: source_table or current_table}, table_sources, cte_names)
+                all_results.extend(sub_results)
+        return all_results if all_results else [(trace_to_base_table(column_name, current_table, sql_text, cte_names), column_name)]
+
+    source_table = find_column_source_in_cte(column_name, current_table, sql_text, cte_names=cte_names)
+    print(f"Direct source table for {column_name}: {source_table}")  # Debug
+    if source_table and source_table not in cte_names:
+        return [(source_table, column_name)]
+    return [(trace_to_base_table(column_name, current_table, sql_text, cte_names), column_name)]
+
+
+def trace_to_base_table(column_name, current_table, sql_text, cte_names=None):
+    """Trace a column to its base table through CTEs and subqueries."""
+    if cte_names is None:
+        cte_names = extract_cte_names(sql_text)
+
+    print(f"Tracing to base table for {column_name} in {current_table}")  # Debug
+
+    # Check if current_table is a subquery
+    subquery_match = re.search(rf'\((.*?)\)\s*(?:AS\s+)?{re.escape(current_table)}\b', sql_text, re.IGNORECASE | re.DOTALL)
+    if subquery_match:
+        underlying_columns = find_underlying_source_columns(column_name, current_table, sql_text)
+        if underlying_columns:
+            all_results = []
+            for col, alias in underlying_columns:
+                # If alias is None, use the single table from the subquery
+                if alias is None and len(extract_final_table_aliases(subquery_match.group(1), cte_names)) == 1:
+                    alias = list(extract_final_table_aliases(subquery_match.group(1), cte_names).keys())[0]
+                source_table = find_column_source_in_cte(col, current_table, sql_text, specific_alias=alias, cte_names=cte_names)
+                print(f"Resolved source table for {col} (alias {alias}): {source_table}")  # Debug
+                if source_table and source_table not in cte_names:
+                    all_results.append((source_table, col))
+                else:
+                    source_table = trace_to_base_table(col, source_table or current_table, sql_text, cte_names)
+                    all_results.append((source_table, col))
+            return all_results[0][0] if all_results else current_table
+
+    underlying_columns = find_underlying_source_columns(column_name, current_table, sql_text)
+    if underlying_columns:
+        all_results = []
+        for col, alias in underlying_columns:
+            source_table = find_column_source_in_cte(col, current_table, sql_text, specific_alias=alias, cte_names=cte_names)
+            print(f"Resolved source table for {col} (alias {alias}): {source_table}")  # Debug
+            if source_table and source_table not in cte_names:
+                all_results.append((source_table, col))
+            else:
+                source_table = trace_to_base_table(col, source_table or current_table, sql_text, cte_names)
+                all_results.append((source_table, col))
+        return all_results[0][0] if all_results else current_table
+
+    source_table = find_column_source_in_cte(column_name, current_table, sql_text, cte_names=cte_names)
+    if source_table and source_table not in cte_names:
+        print(f"Base table found: {source_table} for {column_name}")  # Debug
+        return source_table
+
+    if source_table and source_table in cte_names:
+        return trace_to_base_table(column_name, source_table, sql_text, cte_names)
+
+    print(f"Fallback to {current_table} for {column_name}")  # Debug
+    return current_table if current_table else "Unknown"
+
+
+def extract_final_select(sql_text):
+    """Extract the final SELECT clause (the main query, not subqueries/CTEs)."""
+    select_positions = []
+    paren_depth = 0
+    pos = 0
+    while pos < len(sql_text):
+        if sql_text[pos] == '(':
+            paren_depth += 1
+        elif sql_text[pos] == ')':
+            paren_depth -= 1
+        elif sql_text[pos:pos+6].upper() == 'SELECT' and paren_depth == 0:
+            select_positions.append(pos)
+        pos += 1
+
+    if select_positions:
+        last_select_pos = select_positions[-1]
+        from_pos = sql_text.upper().find('FROM', last_select_pos)
+        if from_pos != -1:
+            return sql_text[last_select_pos + 6:from_pos].strip()
+
+    return ""
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python sql_parse.py <sql_file>")
+        sys.exit(1)
+
+    sql_file = sys.argv[1]
+    try:
+        with open(sql_file, 'r', encoding='utf-8') as f:
+            sql_content = f.read()
+    except FileNotFoundError:
+        print(f"Error: File '{sql_file}' not found.")
+        sys.exit(1)
+
+    print(f"Analyzing SQL file: {sql_file}")
+    print("=" * 60)
+
+    attributes = extract_all_column_references(sql_content)
+    if attributes:
+        print("\nAttribute Name\t\tTable Name/Alias")
+        print("-" * 50)
+        for attr_name, table_source in attributes:
+            print(f"{attr_name:<20}\t{table_source}")
+    else:
+        print("No attributes found.")
+
+
+if __name__ == "__main__":
+    main()
