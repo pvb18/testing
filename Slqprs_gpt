@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+#
+# parse_sql_lineage.sh - recursive generic SQL lineage parser
+#
+# Usage: bash parse_sql_lineage.sh query.sql > lineage.csv
+#
+
+set -euo pipefail
+
+sql_file="$1"
+if [[ -z "$sql_file" || ! -f "$sql_file" ]]; then
+  echo "Usage: $0 query.sql" >&2
+  exit 1
+fi
+
+# Normalize SQL: remove comments, flatten spaces, uppercase keywords for easier parsing
+sql=$(sed -e 's/--.*$//' "$sql_file" \
+  | tr '\n' ' ' \
+  | sed -E 's/\s+/ /g' \
+  | sed -E 's/;[ ]*$//' \
+  | sed -E 's/\bwith\b/WITH/Ig' \
+  | sed -E 's/\bselect\b/SELECT/Ig' \
+  | sed -E 's/\bfrom\b/FROM/Ig' \
+  | sed -E 's/\bas\b/AS/Ig' \
+  | sed -E 's/\bjoin\b/JOIN/Ig' \
+  | sed -E 's/\binner join\b/INNER JOIN/Ig' \
+  | sed -E 's/\bleft join\b/LEFT JOIN/Ig' \
+  | sed -E 's/\bright join\b/RIGHT JOIN/Ig' \
+  | sed -E 's/\bon\b/ON/Ig' \
+  | sed -E 's/\bwhere\b/WHERE/Ig' \
+  | sed -E 's/\bgroup by\b/GROUP BY/Ig' \
+  | sed -E 's/\border by\b/ORDER BY/Ig')
+
+# Declare associative arrays for CTEs and table aliases (bash 4+)
+declare -A CTE_MAP
+declare -A ALIAS_MAP
+
+# Function: extract CTEs from WITH clause and store them
+extract_ctes() {
+  local s="$1"
+  # Extract everything inside WITH (...) SELECT or WITH ... SELECT
+  # We assume top-level WITH clause ends before main SELECT
+
+  # Extract content between WITH and the main SELECT of outer query
+  # This sed grabs everything after WITH up to the last closing paren before SELECT
+  local with_clause
+  with_clause=$(echo "$s" | sed -n 's/.*WITH\s\(.*\)\sSELECT.*/\1/p')
+
+  # If no WITH clause found, return
+  [[ -z "$with_clause" ]] && return
+
+  # Split CTEs by commas that are NOT inside parentheses
+  # Bash can't do recursive regex, so a quick way is to iterate char by char
+  local -a parts
+  parts=()
+  local buffer=""
+  local depth=0
+  local i ch
+  for (( i=0; i<${#with_clause}; i++ )); do
+    ch="${with_clause:$i:1}"
+    if [[ "$ch" == "(" ]]; then
+      ((depth++))
+      buffer+="$ch"
+    elif [[ "$ch" == ")" ]]; then
+      ((depth--))
+      buffer+="$ch"
+    elif [[ "$ch" == "," && $depth -eq 0 ]]; then
+      parts+=("$buffer")
+      buffer=""
+    else
+      buffer+="$ch"
+    fi
+  done
+  parts+=("$buffer")
+
+  # Now for each part, extract CTE name and body
+  for part in "${parts[@]}"; do
+    # Extract name and body: NAME AS (BODY)
+    if [[ "$part" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]+AS[[:space:]]*\((.*)\)[[:space:]]*$ ]]; then
+      local cte_name="${BASH_REMATCH[1]}"
+      local cte_body="${BASH_REMATCH[2]}"
+      # Remove outer parentheses in body if any
+      while [[ "$cte_body" =~ ^\((.*)\)$ ]]; do
+        cte_body="${BASH_REMATCH[1]}"
+      done
+      CTE_MAP["$cte_name"]="$cte_body"
+    fi
+  done
+}
+
+# Function: recursively resolve a FROM/JOIN source to base tables
+resolve_from_clause() {
+  local clause="$1"
+  # Output lines: alias|base_table_or_cte_sql
+
+  # Break on JOIN/INNER JOIN/LEFT JOIN/RIGHT JOIN to get individual tables
+  # Simplify by splitting on JOIN keywords outside parentheses
+  local parts=()
+  local buffer=""
+  local depth=0
+  local i ch
+  local clause_len=${#clause}
+  local prev_char=""
+  for ((i=0;i<clause_len;i++)); do
+    ch="${clause:$i:1}"
+    if [[ "$ch" == "(" ]]; then
+      ((depth++))
+      buffer+="$ch"
+    elif [[ "$ch" == ")" ]]; then
+      ((depth--))
+      buffer+="$ch"
+    elif [[ $depth -eq 0 ]]; then
+      # Check for JOIN keywords ahead
+      # We look ahead 5 chars max for JOIN or INNER JOIN etc.
+      local ahead="${clause:$i:10}"
+      if [[ "$ahead" =~ ^[[:space:]]*(INNER JOIN|LEFT JOIN|RIGHT JOIN|FULL JOIN|JOIN)[[:space:]] ]]; then
+        parts+=("$buffer")
+        buffer=""
+        # skip the join keyword itself (jump i forward)
+        if [[ "$ahead" =~ ^[[:space:]]*INNER[[:space:]]JOIN ]]; then ((i+=9))
+        elif [[ "$ahead" =~ ^[[:space:]]*LEFT[[:space:]]JOIN ]]; then ((i+=8))
+        elif [[ "$ahead" =~ ^[[:space:]]*RIGHT[[:space:]]JOIN ]]; then ((i+=9))
+        elif [[ "$ahead" =~ ^[[:space:]]*FULL[[:space:]]JOIN ]]; then ((i+=8))
+        else ((i+=4)); fi
+      else
+        buffer+="$ch"
+      fi
+    else
+      buffer+="$ch"
+    fi
+  done
+  [[ -n "$buffer" ]] && parts+=("$buffer")
+
+  # For each part, extract base table and alias
+  for p in "${parts[@]}"; do
+    # Remove ON clauses if present
+    p_no_on=$(echo "$p" | sed -E 's/\bON\b.*$//I')
+    # Extract alias: FROM Table AS alias OR FROM Table alias OR just Table
+    if [[ "$p_no_on" =~ ([A-Za-z0-9_.]+)[[:space:]]+AS[[:space:]]+([A-Za-z0-9_]+) ]]; then
+      echo "${BASH_REMATCH[2]}|${BASH_REMATCH[1]}"
+    elif [[ "$p_no_on" =~ ([A-Za-z0-9_.]+)[[:space:]]+([A-Za-z0-9_]+) ]]; then
+      echo "${BASH_REMATCH[2]}|${BASH_REMATCH[1]}"
+    else
+      # No alias, use table name as alias
+      tbl=$(echo "$p_no_on" | awk '{print $1}')
+      echo "$tbl|$tbl"
+    fi
+  done
+}
+
+# Function: parse columns in a SELECT expression
+# It extracts all column references like alias.col or col, including inside functions, CASE, window, etc.
+extract_columns() {
+  local expr="$1"
+  # Remove string literals to avoid confusion
+  expr=$(echo "$expr" | sed -E "s/'[^']*'//g")
+  # Extract all alias.col or col references (avoid keywords)
+  echo "$expr" | grep -oE '[A-Za-z0-9_]+\.[A-Za-z0-9_]+' | sort -u
+}
+
+# Function: recursively resolve an alias to its base table
+# If alias is a CTE, recurse into that CTE body and extract base tables
+resolve_alias_rec() {
+  local alias="$1"
+  local from_clause="$2"
+
+  # Find base table for alias from from_clause
+  local base_table=""
+  while read -r line; do
+    a=$(echo "$line" | cut -d'|' -f1)
+    t=$(echo "$line" | cut -d'|' -f2)
+    if [[ "$a" == "$alias" ]]; then
+      base_table="$t"
+      break
+    fi
+  done < <(resolve_from_clause "$from_clause")
+
+  if [[ -z "$base_table" ]]; then
+    # Unknown alias, print alias
+    echo "$alias"
+    return
+  fi
+
+  # If base_table is a CTE, recurse
+  if [[ -n "${CTE_MAP[$base_table]:-}" ]]; then
+    # Extract FROM clause of CTE and resolve base tables there
+    local cte_sql="${CTE_MAP[$base_table]}"
+    local cte_from=$(echo "$cte_sql" | sed -n 's/.*FROM\s\(.*\)\(WHERE\|GROUP BY\|ORDER BY\|$.*\).*/\1/I;p')
+    if [[ -z "$cte_from" ]]; then
+      # No FROM clause means base table unknown; print CTE name
+      echo "$base_table"
+      return
+    fi
+    # For recursion, resolve the alias inside the CTE from clause (usually no alias inside CTE from, so just base table)
+    resolve_alias_rec "$alias" "$cte_from"
+  else
+    # Base table is physical table, print it
+    echo "$base_table"
+  fi
+}
+
+# Main logic starts here:
+
+extract_ctes "$sql"
+
+# Get outermost SELECT ... FROM ... WHERE
+outer_select=$(echo "$sql" | sed -n 's/.*SELECT\s\(.*\)\sFROM\s.*/\1/I;p' | head -1)
+outer_from=$(echo "$sql" | sed -n 's/.*FROM\s\(.*\)\sWHERE.*/\1/I;p' | head -1)
+
+# If no WHERE, try to get FROM up to ORDER BY or end
+if [[ -z "$outer_from" ]]; then
+  outer_from=$(echo "$sql" | sed -n 's/.*FROM\s\(.*\)\sORDER BY.*/\1/I;p' | head -1)
+fi
+if [[ -z "$outer_from" ]]; then
+  outer_from=$(echo "$sql" | sed -n 's/.*FROM\s\(.*\)$/\1/I;p' | head -1)
+fi
+
+# Split outer select on commas not inside parentheses
+IFS=',' read -ra sel_cols <<< "$(echo "$outer_select" | sed -E 's/\s*,\s*/,/g')"
+
+# Print CSV header
+echo "AttributeName,TableName,ActualAttributeName"
+
+for col in "${sel_cols[@]}"; do
+  col=$(echo "$col" | sed -E 's/^\s+|\s+$//g')
+  # Extract alias name if exists
+  alias_name="$col"
+  if [[ "$col" =~ (.*)\s+AS\s+([A-Za-z0-9_]+)$ ]]; then
+    expr="${BASH_REMATCH[1]}"
+    alias_name="${BASH_REMATCH[2]}"
+  else
+    expr="$col"
+  fi
+
+  # Extract all columns (alias.col) inside expr recursively (including CASE, window)
+  col_refs=$(extract_columns "$expr")
+
+  # If no alias.col found, try unqualified columns (skip SQL keywords)
+  if [[ -z "$col_refs" ]]; then
+    # remove known SQL keywords
+    expr_no_kw=$(echo "$expr" | sed -E 's/\b(CASE|WHEN|THEN|ELSE|END|OVER|PARTITION|ORDER|BY|RANK|SUM|AVG|MIN|MAX|EXTRACT|YEAR|MONTH|CURRENT_DATE|SELECT|FROM|WHERE|AND|OR|NOT|IN|AS|ON|JOIN)\b//Ig')
+    # now extract possible columns (words)
+    col_refs=$(echo "$expr_no_kw" | grep -oE '[A-Za-z0-9_]+' | sort -u)
+  fi
+
+  for ref in $col_refs; do
+    # If ref is alias.col format, split
+    if [[ "$ref" == *"."* ]]; then
+      tbl_alias="${ref%%.*}"
+      attr="${ref#*.}"
+      base_table=$(resolve_alias_rec "$tbl_alias" "$outer_from")
+      echo "$alias_name,$base_table,$attr"
+    else
+      # unqualified column, table unknown
+      echo "$alias_name,UNKNOWN,$ref"
+    fi
+  done
+done
