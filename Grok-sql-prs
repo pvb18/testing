@@ -1,0 +1,257 @@
+#!/bin/bash
+# Generic shell script to parse SQL queries and output lineage information.
+# Uses sed for initial normalization and awk for parsing logic.
+# Purpose:
+#   Parses complex SQL queries (e.g., with CTEs, subqueries, CASE statements, window functions)
+#   to trace each attribute in the final SELECT list to its base table and column.
+# Features:
+#   - Handles CTEs (WITH clauses), subqueries in FROM, table/column aliases.
+#   - Extracts qualified column references (alias.column) from SELECT expressions.
+#   - Recursively resolves CTEs and subqueries to find base physical tables.
+#   - Outputs CSV: AttributeName (final alias), TableName (base table), ActualAttributeName (base column).
+#   - Multiple output lines per attribute if it depends on multiple base columns.
+# Limitations:
+#   - Input SQL via stdin, one query per run.
+#   - Assumes uppercase keywords (normalizes input to uppercase).
+#   - Requires qualified columns (e.g., alias.column); ignores unqualified columns.
+#   - Supports subqueries in FROM, not in SELECT or WHERE.
+#   - Basic FROM clause parsing: expects "table alias", "table AS alias", "(subquery) AS alias".
+#   - Skips JOIN details but captures tables/aliases after JOINs.
+#   - No support for UNION, schema-qualified tables, or comments/strings with keywords.
+#   - Best-effort for complex queries; may fail on very complex syntax.
+# Usage:
+#   echo "YOUR_SQL_QUERY" | ./script.sh
+# Example:
+#   echo "WITH cte AS (SELECT col1 AS alias FROM base_table t) SELECT c.alias AS final FROM cte c" | ./script.sh
+# Output:
+#   AttributeName,TableName,ActualAttributeName
+#   final,base_table,col1
+
+# Normalize input SQL:
+#   - Remove comments (--.*).
+#   - Replace newlines with spaces.
+#   - Convert to uppercase.
+#   - Collapse multiple spaces to single.
+#   - Trim leading/trailing spaces.
+sql=$(cat | \
+  sed 's/--.*//g' | \
+  tr '\n' ' ' | \
+  tr a-z A-Z | \
+  sed 's/[ ]*/ /g' | \
+  sed 's/^ //g' | \
+  sed 's/ $//g')
+
+# Pipe normalized SQL to awk for parsing and lineage extraction.
+echo "$sql" | awk '
+  # Helper: Normalize string by collapsing spaces and trimming.
+  function normalize(str) {
+    gsub(/[ ]+/, " ", str)
+    gsub(/^ /, "", str)
+    gsub(/ $/, "", str)
+    return str
+  }
+
+  # Helper: Find position of next top-level keyword (e.g., " FROM ") from a list.
+  # Ignores keywords inside parentheses to avoid nested clauses.
+  function find_next_keyword(q, pos, kw_list,    kw_arr, n, i, ch, nest, k, kw, len) {
+    n = split(kw_list, kw_arr, ",")
+    nest = 0
+    for (i = pos; i <= length(q); i++) {
+      ch = substr(q, i, 1)
+      if (ch == "(") nest++
+      if (ch == ")") nest--
+      if (nest == 0) {
+        for (k = 1; k <= n; k++) {
+          kw = " " kw_arr[k] " "
+          len = length(kw)
+          if (substr(q, i - 1, len) == kw) {
+            return i - 1  # Return position of space before keyword
+          }
+        }
+      }
+    }
+    return 0  # Keyword not found
+  }
+
+  # Helper: Split string by separator at top level (ignores nested parentheses).
+  # Used to split SELECT list into expressions.
+  function split_top_level(s, sep, arr,    i, nest, start, ch) {
+    delete arr
+    nest = 0
+    start = 1
+    for (i = 1; i <= length(s); i++) {
+      ch = substr(s, i, 1)
+      if (ch == "(") nest++
+      if (ch == ")") nest--
+      if (nest == 0 && substr(s, i, 1) == sep) {
+        arr[length(arr) + 1] = normalize(substr(s, start, i - start))
+        start = i + 1
+      }
+    }
+    if (start <= length(s)) {
+      arr[length(arr) + 1] = normalize(substr(s, start))
+    }
+  }
+
+  # Helper: Extract qualified column names (alias.column) from an expression.
+  # Uses regex to find patterns like A-Z0-9_+.A-Z0-9_+.
+  function parse_expr_for_columns(expr, cols,    cnt, tmp) {
+    delete cols
+    cnt = 0
+    tmp = expr
+    while (match(tmp, /[A-Z0-9_]+\.[A-Z0-9_]+/)) {
+      cols[++cnt] = substr(tmp, RSTART, RLENGTH)
+      tmp = substr(tmp, RSTART + RLENGTH)
+    }
+  }
+
+  # Main recursive function: Parse query, resolve lineages, print CSV lines.
+  # Parameters:
+  #   q: Normalized query string.
+  #   parent_ctes: Array of parent CTEs (name => subquery).
+  #   final_attr: Top-level attribute name for output (used in recursion).
+  #   filter_attr: If set, only process SELECT item with this alias (for recursion).
+  function parse_query(q, parent_ctes, final_attr, filter_attr,
+                      local_ctes, pos, name, subq_start, nest, ch, subq,
+                      main_q, pos_select, pos_from, select_list, pos_next,
+                      from_clause, alias_to_source, tmp_pos, str, parts,
+                      tbl, al, items, i, item, expr, alias, cols, j, c,
+                      table_alias, actual, table, subquery, print_attr) {
+    q = normalize(q)
+
+    # Initialize local CTEs from parent CTEs.
+    delete local_ctes
+    for (key in parent_ctes) local_ctes[key] = parent_ctes[key]
+
+    # Parse WITH clause for local CTEs.
+    if (substr(q, 1, 5) == "WITH ") {
+      pos = 6
+      while (pos <= length(q)) {
+        if (match(substr(q, pos), /^[A-Z0-9_]+ /) == 0) break
+        name = substr(q, pos, RLENGTH - 1)
+        pos += RLENGTH
+        if (substr(q, pos, 4) == "AS ") pos += 3
+        if (substr(q, pos, 1) == "(") pos++
+        subq_start = pos
+        nest = 1
+        while (nest > 0 && pos <= length(q)) {
+          ch = substr(q, pos, 1)
+          if (ch == "(") nest++
+          if (ch == ")") nest--
+          pos++
+        }
+        subq = normalize(substr(q, subq_start, pos - subq_start - 1))
+        local_ctes[name] = subq
+        if (substr(q, pos, 1) == ",") pos++
+        else break
+      }
+      main_q = normalize(substr(q, pos))
+    } else {
+      main_q = q
+    }
+
+    # Extract SELECT and FROM clauses from main query.
+    pos_select = index(main_q, "SELECT ")
+    if (pos_select == 0) return
+    pos_from = find_next_keyword(main_q, pos_select + 7, "FROM")
+    if (pos_from == 0) return
+    select_list = normalize(substr(main_q, pos_select + 7, pos_from - pos_select - 7))
+    pos_next = find_next_keyword(main_q, pos_from + 5, "WHERE,GROUP BY,HAVING,ORDER BY,LIMIT,;")
+    if (pos_next == 0) pos_next = length(main_q) + 1
+    from_clause = normalize(substr(main_q, pos_from + 5, pos_next - pos_from - 5))
+
+    # Build alias-to-source map from FROM clause.
+    delete alias_to_source
+    tmp_pos = 1
+    while (tmp_pos <= length(from_clause)) {
+      # Subquery AS alias: (subquery) AS alias
+      if (match(substr(from_clause, tmp_pos), /^\([^\(]*\) AS [A-Z0-9_]+ /)) {
+        str = substr(from_clause, tmp_pos, RLENGTH - 1)
+        split(str, parts, / AS /)
+        tbl = normalize(parts[1])
+        al = normalize(parts[2])
+        alias_to_source[al] = tbl
+        tmp_pos += RLENGTH
+      # Table AS alias
+      } else if (match(substr(from_clause, tmp_pos), /^[A-Z0-9_]+ AS [A-Z0-9_]+ /)) {
+        str = substr(from_clause, tmp_pos, RLENGTH - 1)
+        split(str, parts, / AS /)
+        tbl = normalize(parts[1])
+        al = normalize(parts[2])
+        alias_to_source[al] = tbl
+        tmp_pos += RLENGTH
+      # Table alias (without AS)
+      } else if (match(substr(from_clause, tmp_pos), /^[A-Z0-9_]+ [A-Z0-9_]+ /)) {
+        str = substr(from_clause, tmp_pos, RLENGTH - 1)
+        split(str, parts, / /)
+        tbl = parts[1]
+        al = parts[2]
+        alias_to_source[al] = tbl
+        tmp_pos += RLENGTH
+      # Table without alias
+      } else if (match(substr(from_clause, tmp_pos), /^[A-Z0-9_]+ /)) {
+        tbl = substr(from_clause, tmp_pos, RLENGTH - 1)
+        alias_to_source[tbl] = tbl
+        tmp_pos += RLENGTH
+      } else {
+        tmp_pos++  # Skip non-matching (e.g., JOIN, ON)
+      }
+    }
+
+    # Parse SELECT list into expressions.
+    split_top_level(select_list, ",", items)
+    for (i in items) {
+      item = items[i]
+      # Handle expr AS alias or expr alone.
+      if (match(item, / AS /)) {
+        split(item, parts, / AS /)
+        expr = normalize(parts[1])
+        alias = normalize(parts[2])
+      } else {
+        expr = item
+        alias = expr  # Use expr as alias if no AS
+      }
+
+      # Skip if filtering for specific attribute and not matching.
+      if (filter_attr && alias != filter_attr) continue
+
+      # Extract columns from expression.
+      parse_expr_for_columns(expr, cols)
+      for (j in cols) {
+        c = cols[j]
+        split(c, parts, ".")
+        table_alias = parts[1]
+        actual = parts[2]
+
+        table = alias_to_source[table_alias]
+        if (table == "") continue
+
+        # Check if table is a CTE or subquery.
+        subquery = ""
+        if (table in local_ctes) {
+          subquery = local_ctes[table]
+        } else if (substr(table, 1, 1) == "(" && substr(table, length(table), 1) == ")") {
+          subquery = normalize(substr(table, 2, length(table) - 2))
+        }
+
+        # Determine output attribute name.
+        print_attr = (final_attr ? final_attr : alias)
+
+        if (subquery != "") {
+          # Recurse into subquery/CTE, filtering for the dependent column.
+          parse_query(subquery, local_ctes, print_attr, actual)
+        } else {
+          # Base case: Output lineage for physical table.
+          print print_attr "," table "," actual
+        }
+      }
+    }
+  }
+
+  # Main entry point.
+  BEGIN {
+    print "AttributeName,TableName,ActualAttributeName"  # CSV header
+    delete ctes  # Initialize empty CTEs array
+    parse_query($0, ctes, "", "")  # Parse entire query
+  }
+'
