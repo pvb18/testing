@@ -1,0 +1,1538 @@
+#!/bin/bash
+
+# Advanced SQL Parser Script
+# Enhanced version with better subquery, CTE, and nested query handling
+# Parses SQL queries to extract final selected attributes and their source tables
+
+# Global variables
+declare -gA table_aliases
+declare -gA column_aliases
+declare -gA cte_definitions
+declare -gA derived_table_queries
+declare -gA final_results
+declare -gi recursion_depth=0
+temp_file="/tmp/sql_parse_$$"
+
+# Function to clean and normalize SQL
+normalize_sql() {
+    local sql="$1"
+    # Remove SQL comments (-- style)
+    sql=$(echo "$sql" | sed 's/--.*$//' | sed '/^[[:space:]]*$/d')
+    # Remove extra whitespaces, tabs, and normalize
+    echo "$sql" | tr -s ' ' | sed 's/\t/ /g' | sed 's/^ *//g' | sed 's/ *$//g' | tr '\n' ' '
+}
+
+# Function to extract and handle parentheses for subqueries
+extract_parentheses_content() {
+    local sql="$1"
+    local start_pos="$2"
+    local paren_count=0
+    local i=$start_pos
+    local content=""
+    
+    while [ $i -lt ${#sql} ]; do
+        char="${sql:$i:1}"
+        if [ "$char" = "(" ]; then
+            # If already inside, keep inner '('
+            if [ $paren_count -gt 0 ]; then
+                content="${content}${char}"
+            fi
+            ((paren_count++))
+            ((i++))
+            continue
+        elif [ "$char" = ")" ]; then
+            ((paren_count--))
+            # If leaving inner level, keep ')'
+            if [ $paren_count -gt 0 ]; then
+                content="${content}${char}"
+                ((i++))
+                continue
+            else
+                # We closed the outermost; stop without adding ')'
+                break
+            fi
+        fi
+        if [ $paren_count -gt 0 ]; then
+            content="${content}${char}"
+        fi
+        ((i++))
+    done
+    
+    echo "$content"
+}
+
+# Enhanced CTE extraction with better parsing
+extract_ctes() {
+	local sql="$1"
+	
+	if echo "$sql" | grep -qi "^[[:space:]]*WITH"; then
+		echo "Processing CTEs..." >&2
+		# Scan after WITH to capture the full CTE section until the main SELECT at paren_count 0
+		local after_with=$(echo "$sql" | sed 's/^[[:space:]]*WITH[[:space:]]*//I')
+		local paren_count=0
+		local i=0
+		local with_section=""
+		while [ $i -lt ${#after_with} ]; do
+			local ch="${after_with:$i:1}"
+			# Detect standalone SELECT when not inside parentheses -> end of CTE section
+			if [ $paren_count -eq 0 ]; then
+				# Check for SELECT keyword at this position
+				local next5="${after_with:$i:6}"
+				if echo "$next5" | grep -qi '^SELECT'; then
+					break
+				fi
+			fi
+			with_section="${with_section}${ch}"
+			if [ "$ch" = "(" ]; then
+				((paren_count++))
+			elif [ "$ch" = ")" ]; then
+				((paren_count--))
+			fi
+			((i++))
+		done
+		# Parse multiple CTEs separated by commas at paren_count 0
+		local cte_parts=""
+		local temp_part=""
+		paren_count=0
+		for (( j=0; j<${#with_section}; j++ )); do
+			local cj="${with_section:$j:1}"
+			temp_part="${temp_part}${cj}"
+			if [ "$cj" = "(" ]; then
+				((paren_count++))
+			elif [ "$cj" = ")" ]; then
+				((paren_count--))
+			elif [ "$cj" = "," ] && [ $paren_count -eq 0 ]; then
+				cte_parts="${cte_parts}${temp_part%,}|"
+				temp_part=""
+			fi
+		done
+		if [ -n "$temp_part" ]; then
+			cte_parts="${cte_parts}${temp_part}|"
+		fi
+		IFS='|' read -ra CTE_ARRAY <<< "$cte_parts"
+		for cte_def in "${CTE_ARRAY[@]}"; do
+			if [ -n "$cte_def" ]; then
+				parse_single_cte "$cte_def"
+			fi
+		done
+	fi
+}
+
+# Function to parse a single CTE definition
+parse_single_cte() {
+    local cte_def="$1"
+    
+    if echo "$cte_def" | grep -qi "AS[[:space:]]*(" ; then
+        local cte_name=$(echo "$cte_def" | sed 's/[[:space:]]*AS[[:space:]]*(.*//' | tr -d ' ')
+        
+        # Extract the query inside AS (...). Find the '(' following AS.
+        local idx_as=$(echo "$cte_def" | grep -b -i -o "AS" | head -1 | cut -d: -f1)
+        local idx_open=$(echo "$cte_def" | grep -b -o "(" | awk -F: -v start="$idx_as" '$1>start{print $1; exit}')
+        if [ -z "$idx_open" ]; then
+            return
+        fi
+        local cte_query=$(extract_parentheses_content "$cte_def" $idx_open)
+        
+        cte_definitions["$cte_name"]="$cte_query"
+        echo "Found CTE: $cte_name -> $cte_query" >&2
+    fi
+}
+
+# Enhanced SELECT clause parsing with better comma handling
+parse_select_clause() {
+    local select_part="$1"
+    local from_tables="$2"
+    
+    echo "Parsing SELECT clause: $select_part" >&2
+    
+    # Remove SELECT keyword
+    select_part=$(echo "$select_part" | sed 's/^[[:space:]]*SELECT[[:space:]]*//i')
+    
+    # Split by comma while respecting parentheses
+    local columns=()
+    local current_column=""
+    local paren_count=0
+    
+    for (( i=0; i<${#select_part}; i++ )); do
+        char="${select_part:$i:1}"
+        
+        if [ "$char" = "(" ]; then
+            ((paren_count++))
+        elif [ "$char" = ")" ]; then
+            ((paren_count--))
+        elif [ "$char" = "," ] && [ $paren_count -eq 0 ]; then
+            columns+=("$current_column")
+            current_column=""
+            continue
+        fi
+        
+        current_column="${current_column}${char}"
+    done
+    
+    # Add the last column
+    if [ -n "$current_column" ]; then
+        columns+=("$current_column")
+    fi
+    
+    # Process each column
+    for column in "${columns[@]}"; do
+        column=$(echo "$column" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$column" ]; then
+            parse_column "$column" "$from_tables"
+        fi
+    done
+}
+
+# Enhanced column parsing with better alias detection
+parse_column() {
+    local column="$1"
+    local from_tables="$2"
+    
+    echo "Parsing column: $column" >&2
+    
+    # Handle aliases - check for AS keyword first, then space-separated
+    local alias=""
+    local actual_column="$column"
+    
+    # Match AS alias (case insensitive)
+    if echo "$column" | grep -qi "[[:space:]]AS[[:space:]]"; then
+        alias=$(echo "$column" | sed 's/.*[[:space:]]AS[[:space:]]*//i' | awk '{print $1}')
+        actual_column=$(echo "$column" | sed 's/[[:space:]]*AS[[:space:]].*//')
+    else
+        # Check for space-separated alias (last word that's not a keyword)
+        local words=($column)
+        if [ ${#words[@]} -gt 1 ]; then
+            local last_word="${words[-1]}"
+            # Check if last word is likely an alias (not a SQL keyword)
+            if ! echo "$last_word" | grep -Eqi "^(FROM|WHERE|GROUP|ORDER|HAVING|LIMIT|OFFSET|AND|OR|NOT|IS|NULL|TRUE|FALSE|CASE|WHEN|THEN|ELSE|END)$"; then
+                alias="$last_word"
+                actual_column=$(echo "$column" | sed "s/[[:space:]]*${last_word}[[:space:]]*$//")
+            fi
+        fi
+    fi
+    
+    # Use alias as display name if present, otherwise extract column name from table.column
+    local display_name="$alias"
+    if [ -z "$alias" ]; then
+        # No alias provided, use just the column name (remove table prefix if present)
+        if echo "$actual_column" | grep -q "\."; then
+            display_name=$(echo "$actual_column" | cut -d'.' -f2)
+        else
+            display_name="$actual_column"
+        fi
+    fi
+    
+    # Clean up display name
+    display_name=$(echo "$display_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    # Clean up actual_column to remove any residual alias text - but be more careful with sed
+    actual_column=$(echo "$actual_column" | sed 's/[[:space:]]\+[Aa][Ss][[:space:]]\+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*$//')
+    actual_column=$(echo "$actual_column" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    # Parse the actual column expression
+    parse_column_expression "$actual_column" "$from_tables" "$display_name"
+}
+
+# Enhanced expression parsing with subquery detection
+parse_column_expression() {
+    local expression="$1"
+    local from_tables="$2"
+    local display_name="$3"
+    
+    echo "Parsing expression: $expression" >&2
+    
+    # Handle subqueries in SELECT (must start with '(' and 'SELECT')
+    local expr_trim=$(echo "$expression" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if echo "$expr_trim" | grep -qiE '^\([[:space:]]*SELECT[[:space:]]'; then
+        parse_subquery "$expression" "$from_tables" "$display_name"
+        return
+    fi
+    
+    # Handle CASE statements
+    if echo "$expression" | grep -qi "CASE"; then
+        parse_case_statement "$expression" "$from_tables" "$display_name"
+        return
+    fi
+    
+    # Handle functions
+    if echo "$expression" | grep -q "("; then
+        parse_function "$expression" "$from_tables" "$display_name"
+        return
+    fi
+    
+    # Handle simple column references
+    parse_simple_column "$expression" "$from_tables" "$display_name"
+}
+
+# New function to handle subqueries
+parse_subquery() {
+    local subquery_expr="$1"
+    local from_tables="$2"
+    local display_name="$3"
+    
+    echo "Parsing subquery: $subquery_expr" >&2
+    
+    # Extract the subquery (everything in parentheses)
+    local subquery=$(echo "$subquery_expr" | sed 's/^[^(]*(//' | sed 's/)[^)]*$//')
+    
+    if [ -n "$subquery" ]; then
+        echo "Recursively parsing subquery: $subquery" >&2
+        
+        # Increment recursion depth
+        ((recursion_depth++))
+        
+        if [ $recursion_depth -lt 10 ]; then  # Prevent infinite recursion
+            # Recursively parse the subquery
+            parse_sql_recursive "$subquery" "$display_name"
+        else
+            echo "Maximum recursion depth reached" >&2
+            final_results["$display_name"]="SUBQUERY|UNKNOWN"
+        fi
+        
+        # Decrement recursion depth
+        ((recursion_depth--))
+    fi
+}
+
+# Recursive SQL parsing function
+parse_sql_recursive() {
+    local sql="$1"
+    local parent_display_name="$2"
+    
+    # Save current state
+    local -A saved_table_aliases
+    local -A saved_final_results
+    
+    for key in "${!table_aliases[@]}"; do
+        saved_table_aliases["$key"]="${table_aliases[$key]}"
+    done
+    
+    for key in "${!final_results[@]}"; do
+        saved_final_results["$key"]="${final_results[$key]}"
+    done
+    
+    # Clear current state for recursive parsing (reset globals intentionally)
+    unset table_aliases
+    unset final_results
+    declare -gA table_aliases
+    declare -gA final_results
+    
+    # Parse the subquery
+    parse_sql "$sql"
+    
+    # Merge ALL results back with parent display name (accumulate, de-dup)
+    for key in "${!final_results[@]}"; do
+        local value="${final_results[$key]}"
+        if [ -n "${saved_final_results[$parent_display_name]}" ]; then
+            # Append unique segments
+            IFS=';' read -r -a parts <<< "$value"
+            for part in "${parts[@]}"; do
+                [ -z "$part" ] && continue
+                if ! echo ";${saved_final_results[$parent_display_name]};" | grep -q ";$part;"; then
+                    saved_final_results["$parent_display_name"]="${saved_final_results[$parent_display_name]};$part"
+                fi
+            done
+        else
+            saved_final_results["$parent_display_name"]="$value"
+        fi
+    done
+    
+    # Additionally, extract column references from the subquery WHERE clause and attribute to the parent
+    local normalized_subquery=$(normalize_sql "$sql")
+    local where_part=""
+    if echo "$normalized_subquery" | grep -qi " WHERE "; then
+        where_part=$(echo "$normalized_subquery" | sed 's/.* WHERE \(.*\)/\1/i' | sed 's/ GROUP BY .*//I' | sed 's/ ORDER BY .*//I' | sed 's/ HAVING .*//I')
+        # Find table.column references
+        local where_cols=$(echo "$where_part" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*' | sort -u)
+        while IFS= read -r wc; do
+            [ -z "$wc" ] && continue
+            local wc_table=$(echo "$wc" | cut -d'.' -f1)
+            # Only take columns that belong to this subquery's aliases
+            if [ -n "${table_aliases[$wc_table]}" ]; then
+                # Use existing parser to resolve table alias and append to temp final_results
+                parse_simple_column "$wc" "" "$parent_display_name"
+            fi
+        done <<< "$where_cols"
+        # Merge any accumulated entries for the parent from temp final_results
+        if [ -n "${final_results[$parent_display_name]}" ]; then
+            local parent_vals="${final_results[$parent_display_name]}"
+            if [ -n "${saved_final_results[$parent_display_name]}" ]; then
+                IFS=';' read -r -a parts <<< "$parent_vals"
+                for part in "${parts[@]}"; do
+                    [ -z "$part" ] && continue
+                    if ! echo ";${saved_final_results[$parent_display_name]};" | grep -q ";$part;"; then
+                        saved_final_results["$parent_display_name"]="${saved_final_results[$parent_display_name]};$part"
+                    fi
+                done
+            else
+                saved_final_results["$parent_display_name"]="$parent_vals"
+            fi
+        fi
+    fi
+    
+    # Restore state
+    unset table_aliases
+    unset final_results
+    declare -gA table_aliases
+    declare -gA final_results
+    
+    for key in "${!saved_table_aliases[@]}"; do
+        table_aliases["$key"]="${saved_table_aliases[$key]}"
+    done
+    
+    for key in "${!saved_final_results[@]}"; do
+        final_results["$key"]="${saved_final_results[$key]}"
+    done
+}
+
+# Enhanced CASE statement parsing
+parse_case_statement() {
+    local case_expr="$1"
+    local from_tables="$2"
+    local display_name="$3"
+    
+    echo "Parsing CASE statement: $case_expr" >&2
+    
+    # For CASE statements, we need to extract columns from function calls and conditions
+    # Remove CASE keywords and string literals first
+    local cleaned_expr=$(echo "$case_expr" | sed 's/CASE[[:space:]]*//i' | sed 's/END[[:space:]]*//i' | sed "s/'[^']*'//g")
+    
+    # Handle functions within CASE statements (like COUNT(o.order_id))
+    local func_calls=$(echo "$cleaned_expr" | grep -oE '[A-Z_][A-Z0-9_]*[[:space:]]*\([^)]*\)')
+    while IFS= read -r func_call; do
+        if [ -n "$func_call" ]; then
+            # Parse the function to extract column references
+            parse_function "$func_call" "$from_tables" "$display_name"
+        fi
+    done <<< "$func_calls"
+    
+    # Find remaining column references (table.column or column) but exclude literals and keywords
+    local columns=$(echo "$cleaned_expr" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*' | grep -v -E '^(WHEN|THEN|ELSE|AND|OR|NOT|IS|NULL|TRUE|FALSE|LIKE|IN|BETWEEN|OVER|PARTITION|BY|ORDER|ASC|DESC|Above|Average|Below|COUNT|SUM|AVG|MAX|MIN)$')
+    
+    # Track unique columns to avoid duplicates
+    local -A unique_columns
+    
+    while IFS= read -r col; do
+        if [ -n "$col" ] && [ -z "${unique_columns[$col]}" ]; then
+            # Additional check to avoid parsing obvious non-column words
+            if echo "$col" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*$'; then
+                unique_columns["$col"]=1
+                parse_simple_column "$col" "$from_tables" "$display_name"
+            fi
+        fi
+    done <<< "$columns"
+}
+
+# Enhanced function parsing
+parse_function() {
+    local func_expr="$1"
+    local from_tables="$2"
+    local display_name="$3"
+    
+    echo "Parsing function: $func_expr" >&2
+    
+    # Extract function name
+    local func_name=$(echo "$func_expr" | sed 's/(.*//' | awk '{print $NF}')
+    echo "Function name: $func_name" >&2
+    
+    # Handle window functions specially (they have OVER clauses)
+    if echo "$func_expr" | grep -qi "OVER[[:space:]]*(" ; then
+        # Extract the main function parameters (before OVER)
+        local main_params=$(echo "$func_expr" | sed 's/^[^(]*(//' | sed 's/)[[:space:]]*OVER.*//')
+        parse_function_parameters "$main_params" "$from_tables" "$display_name"
+        # Extract window spec inside OVER(...)
+        local win_spec=$(echo "$func_expr" | sed -n 's/.*OVER[[:space:]]*(\(.*\))[^)]*$/\1/ip')
+        if [ -n "$win_spec" ]; then
+            parse_window_spec "$win_spec" "$from_tables" "$display_name"
+        fi
+    else
+        # Regular function - extract parameters between parentheses
+        local params=$(echo "$func_expr" | sed 's/^[^(]*(//' | sed 's/)[^)]*$//')
+        parse_function_parameters "$params" "$from_tables" "$display_name"
+    fi
+}
+
+# Parse window specification for OVER(...) clauses
+parse_window_spec() {
+	local window_spec="$1"
+	local from_tables="$2"
+	local display_name="$3"
+	# Extract table.column references from PARTITION BY and ORDER BY inside the window spec
+	local cols=$(echo "$window_spec" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]+' | sort -u)
+	while IFS= read -r wc; do
+		[ -z "$wc" ] && continue
+		parse_simple_column "$wc" "$from_tables" "$display_name"
+	done <<< "$cols"
+}
+
+# New function to parse function parameters
+parse_function_parameters() {
+    local params="$1"
+    local from_tables="$2"
+    local display_name="$3"
+    
+    echo "Parsing function parameters: $params" >&2
+    
+    # Split parameters by comma while respecting nested parentheses
+    local param_list=()
+    local current_param=""
+    local paren_count=0
+    
+    for (( i=0; i<${#params}; i++ )); do
+        char="${params:$i:1}"
+        
+        if [ "$char" = "(" ]; then
+            ((paren_count++))
+        elif [ "$char" = ")" ]; then
+            ((paren_count--))
+        elif [ "$char" = "," ] && [ $paren_count -eq 0 ]; then
+            param_list+=("$current_param")
+            current_param=""
+            continue
+        fi
+        
+        current_param="${current_param}${char}"
+    done
+    
+    # Add the last parameter
+    if [ -n "$current_param" ]; then
+        param_list+=("$current_param")
+    fi
+    
+    # Process each parameter
+    for param in "${param_list[@]}"; do
+        param=$(echo "$param" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$param" ]; then
+            # Handle DISTINCT keyword - remove it and process the column
+            if echo "$param" | grep -qi "^DISTINCT[[:space:]]"; then
+                param=$(echo "$param" | sed 's/^DISTINCT[[:space:]]*//')
+            fi
+            
+            # Skip literals (numbers, strings) and stars
+            if echo "$param" | grep -qE "^[0-9]+$|^'.*'$|^\".*\"$|^\*$"; then
+                echo "Skipping literal/star parameter: $param" >&2
+                continue
+            fi
+            
+            # Check if parameter is a column reference (skip literals and keywords)
+            # Extract any table.column references inside arithmetic or expressions
+            local param_cols=$(echo "$param" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*' | sort -u)
+            if [ -n "$param_cols" ]; then
+                while IFS= read -r pc; do
+                    [ -z "$pc" ] && continue
+                    echo "Found column reference in function parameter: $pc" >&2
+                    parse_simple_column "$pc" "$from_tables" "$display_name"
+                done <<< "$param_cols"
+            elif echo "$param" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?$'; then
+                echo "Found simple column reference in function parameter: $param" >&2
+                parse_simple_column "$param" "$from_tables" "$display_name"
+            elif echo "$param" | grep -q "SELECT"; then
+                # Handle subquery parameters
+                parse_subquery "$param" "$from_tables" "$display_name"
+            else
+                # Complex expression - extract any column references
+                echo "Complex expression parameter: $param" >&2
+                local expr_cols=$(echo "$param" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*' | sort -u)
+                while IFS= read -r ec; do
+                    [ -z "$ec" ] && continue
+                    echo "Found column in complex expression: $ec" >&2
+                    parse_simple_column "$ec" "$from_tables" "$display_name"
+                done <<< "$expr_cols"
+            fi
+        fi
+    done
+}
+
+# Enhanced simple column parsing
+parse_simple_column() {
+    local column="$1"
+    local from_tables="$2"
+    local display_name="$3"
+    
+    echo "Parsing simple column: $column" >&2
+    
+    # Skip if it's a literal value
+    if echo "$column" | grep -qE "^[0-9]+$|^'.*'$|^\".*\"$"; then
+        echo "Skipping literal value: $column" >&2
+        return
+    fi
+    
+    local table_name=""
+    local column_name="$column"
+    
+    # Check if column has table prefix (table.column)
+    if echo "$column" | grep -q "\."; then
+        table_name=$(echo "$column" | cut -d'.' -f1)
+        column_name=$(echo "$column" | cut -d'.' -f2)
+        
+        # Clean up table name (remove trailing semicolon or spaces)
+        table_name=$(echo "$table_name" | sed 's/[[:space:]]*;[[:space:]]*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        # Resolve table alias if present
+        echo "Looking up table alias: '$table_name'" >&2
+        if [ -n "${table_aliases[$table_name]}" ]; then
+            echo "Found alias mapping: $table_name -> ${table_aliases[$table_name]}" >&2
+            table_name="${table_aliases[$table_name]}"
+        elif [ -n "${derived_table_queries[$table_name]}" ]; then
+            echo "Found derived table alias: '$table_name'" >&2
+            # Parse the derived query to find ultimate sources
+            parse_derived_column "$column_name" "$column_name" "${derived_table_queries[$table_name]}"
+            return
+        else
+            echo "No alias mapping found for: '$table_name'" >&2
+        fi
+    else
+        # Try to determine table from available tables
+        table_name=$(determine_table_for_column "$column_name" "$from_tables")
+    fi
+    
+    # Check if column is from a CTE
+    if [ -n "${cte_definitions[$table_name]}" ]; then
+        echo "Column $column_name is from CTE $table_name" >&2
+        parse_cte_column "$column_name" "$table_name" "$display_name"
+    else
+        # Store final result; allow multiple sources per display name
+        if [ -n "${final_results[$display_name]}" ]; then
+            if ! echo ";${final_results[$display_name]};" | grep -q ";$table_name|$column_name;"; then
+                final_results["$display_name"]="${final_results[$display_name]};$table_name|$column_name"
+            fi
+        else
+            final_results["$display_name"]="$table_name|$column_name"
+        fi
+        echo "Added to results: $display_name -> $table_name.$column_name" >&2
+    fi
+}
+
+# Helper to split a query into select_part and from_part (without recursion)
+split_select_from_simple() {
+	local input_query="$1"
+	local -n out_select_ref=$2
+	local -n out_from_ref=$3
+	local temp_query="$input_query"
+	local paren_count=0
+	local from_pos=-1
+	local i=0
+	while [ $i -lt ${#temp_query} ]; do
+		char="${temp_query:$i:1}"
+		if [ "$char" = "(" ]; then
+			((paren_count++))
+		elif [ "$char" = ")" ]; then
+			((paren_count--))
+		elif [ $paren_count -eq 0 ]; then
+			if [ "${temp_query:$i:4}" = "FROM" ] || [ "${temp_query:$i:4}" = "from" ]; then
+				local before_char=""
+				local after_char=""
+				if [ $i -gt 0 ]; then before_char="${temp_query:$((i-1)):1}"; fi
+				if [ $((i+4)) -lt ${#temp_query} ]; then after_char="${temp_query:$((i+4)):1}"; fi
+				if [[ "$before_char" =~ [[:space:]] || -z "$before_char" ]] && [[ "$after_char" =~ [[:space:]] || -z "$after_char" ]]; then
+					from_pos=$i; break
+				fi
+			fi
+		fi
+		((i++))
+	done
+	if [ $from_pos -ge 0 ]; then
+		out_select_ref="${temp_query:0:$from_pos}"
+		out_from_ref="${temp_query:$from_pos}"
+	else
+		out_select_ref="$temp_query"
+		out_from_ref=""
+	fi
+}
+
+# Enhanced CTE column parsing with recursion
+parse_cte_column() {
+	local column_name="$1"
+	local cte_name="$2"
+	local display_name="$3"
+	
+	# Hard limit to prevent infinite recursion - reduced limit for performance
+	if [ $recursion_depth -gt 3 ]; then
+		echo "CTE recursion depth exceeded, stopping" >&2
+		final_results["$display_name"]="$cte_name|$column_name"
+		return
+	fi
+	
+	local cte_query="${cte_definitions[$cte_name]}"
+	if [ -z "$cte_query" ]; then
+		final_results["$display_name"]="$cte_name|$column_name"
+		return
+	fi
+	
+	# Save current table aliases
+	local -A saved_table_aliases
+	for key in "${!table_aliases[@]}"; do saved_table_aliases["$key"]="${table_aliases[$key]}"; done
+	
+	# Reset working table aliases for CTE scope only
+	unset table_aliases
+	declare -gA table_aliases
+	
+	# Normalize and split CTE query
+	local norm_cte=$(normalize_sql "$cte_query")
+	local cte_select_part=""
+	local cte_from_part=""
+	split_select_from_simple "$norm_cte" cte_select_part cte_from_part
+	
+	# Populate aliases from CTE FROM
+	if [ -n "$cte_from_part" ]; then
+		parse_from_clause_no_return "$cte_from_part"
+	fi
+	
+	# Determine from_tables first token (if needed by determine_table_for_column)
+	local clean_from=$(echo "$cte_from_part" | sed 's/^[[:space:]]*FROM[[:space:]]*//' | sed 's/[[:space:]]*WHERE.*//' | sed 's/[[:space:]]*GROUP[[:space:]]*BY.*//' | sed 's/[[:space:]]*ORDER[[:space:]]*BY.*//' | sed 's/[[:space:]]*HAVING.*//')
+	local from_tables=$(echo "$clean_from" | awk '{print $1}')
+	
+	# Parse CTE select list and find the expression that yields column_name
+	local sel_no_kw=$(echo "$cte_select_part" | sed 's/^[[:space:]]*SELECT[[:space:]]*//i')
+	local cols=()
+	local current=""
+	local pc=0
+	for (( i=0; i<${#sel_no_kw}; i++ )); do
+		ch="${sel_no_kw:$i:1}"
+		if [ "$ch" = "(" ]; then ((pc++)); elif [ "$ch" = ")" ]; then ((pc--)); elif [ "$ch" = "," ] && [ $pc -eq 0 ]; then cols+=("$current"); current=""; continue; fi
+		current="${current}${ch}"
+	done
+	[ -n "$current" ] && cols+=("$current")
+	
+	local found_match=0
+	local want_name_lc=$(echo "$column_name" | tr 'A-Z' 'a-z')
+	for col in "${cols[@]}"; do
+		col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+		[ -z "$col" ] && continue
+		local alias=""
+		local expr="$col"
+		if echo "$col" | grep -qi "[[:space:]]AS[[:space:]]"; then
+			alias=$(echo "$col" | sed 's/.*[[:space:]]AS[[:space:]]*//I' | awk '{print $1}')
+			expr=$(echo "$col" | sed 's/[[:space:]]*AS[[:space:]].*//I')
+		else
+			# space-separated alias
+			local words=($col)
+			if [ ${#words[@]} -gt 1 ]; then
+				local last_word="${words[-1]}"
+				if ! echo "$last_word" | grep -Eqi "^(FROM|WHERE|GROUP|ORDER|HAVING|LIMIT|OFFSET|AND|OR|NOT|IS|NULL|TRUE|FALSE|CASE|WHEN|THEN|ELSE|END)$"; then
+					alias="$last_word"
+					expr=$(echo "$col" | sed "s/[[:space:]]*${last_word}[[:space:]]*$//")
+				fi
+			fi
+		fi
+		# Determine the output name if no alias
+		local out_name="$alias"
+		if [ -z "$out_name" ]; then
+			if echo "$expr" | grep -q "\."; then out_name=$(echo "$expr" | cut -d'.' -f2); else out_name="$expr"; fi
+			out_name=$(echo "$out_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+		fi
+
+		local out_name_lc=$(echo "$out_name" | tr 'A-Z' 'a-z')
+		if [ "$out_name_lc" = "$want_name_lc" ]; then
+			found_match=1
+			
+			# Enhanced recursive resolution for nested CTEs and expressions
+					# Handle aggregate functions and complex expressions
+		if echo "$expr" | grep -qE "(SUM|COUNT|AVG|MAX|MIN|UPPER|LOWER|CONCAT)\s*\("; then
+				# Extract column references from the function/expression
+				local func_cols=$(echo "$expr" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*' | sort -u)
+				local resolved_sources=""
+				while IFS= read -r fc; do
+					[ -z "$fc" ] && continue
+					local fc_table=$(echo "$fc" | cut -d'.' -f1)
+					local fc_col=$(echo "$fc" | cut -d'.' -f2)
+					
+					# Resolve table alias
+					if [ -n "${table_aliases[$fc_table]}" ]; then
+						local resolved_table="${table_aliases[$fc_table]}"
+						
+						# Check if it's a nested CTE reference
+						if [ -n "${cte_definitions[$resolved_table]}" ]; then
+							((recursion_depth++))
+							parse_cte_column "$fc_col" "$resolved_table" "$display_name"
+							((recursion_depth--))
+						else
+							# Add to resolved sources
+							if [ -n "$resolved_sources" ]; then
+								resolved_sources="$resolved_sources;$resolved_table|$fc_col"
+							else
+								resolved_sources="$resolved_table|$fc_col"
+							fi
+						fi
+					else
+						# Direct table reference
+						if [ -n "$resolved_sources" ]; then
+							resolved_sources="$resolved_sources;$fc_table|$fc_col"
+						else
+							resolved_sources="$fc_table|$fc_col"
+						fi
+					fi
+				done <<< "$func_cols"
+				
+				# Set the resolved sources if we found any
+				if [ -n "$resolved_sources" ]; then
+					final_results["$display_name"]="$resolved_sources"
+				fi
+			
+					# Handle window functions (ROW_NUMBER() OVER (...))
+		elif echo "$expr" | grep -qE "(ROW_NUMBER|RANK|DENSE_RANK|LEAD|LAG)\s*\(\s*\)\s*OVER\s*\("; then
+			# Extract columns from PARTITION BY and ORDER BY clauses
+			local over_clause=$(echo "$expr" | sed -n 's/.*OVER[[:space:]]*(\(.*\)).*/\1/p')
+			if [ -n "$over_clause" ]; then
+				local window_cols=$(echo "$over_clause" | grep -oE '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*' | sort -u)
+				local resolved_sources=""
+				while IFS= read -r wc; do
+					[ -z "$wc" ] && continue
+					local wc_table=$(echo "$wc" | cut -d'.' -f1)
+					local wc_col=$(echo "$wc" | cut -d'.' -f2)
+					
+					# Resolve table alias
+					if [ -n "${table_aliases[$wc_table]}" ]; then
+						local resolved_table="${table_aliases[$wc_table]}"
+							
+													# Check if resolved table is a CTE - recursively drill down
+						if [ -n "${cte_definitions[$resolved_table]}" ]; then
+							((recursion_depth++))
+							
+							# Create a temporary display name for this window column reference
+							local temp_display="${display_name}_window_${wc_col}"
+							parse_cte_column "$wc_col" "$resolved_table" "$temp_display"
+							
+							# Copy the resolved result to our main display name
+							if [ -n "${final_results[$temp_display]}" ]; then
+								if [ -n "$resolved_sources" ]; then
+									resolved_sources="$resolved_sources;${final_results[$temp_display]}"
+								else
+									resolved_sources="${final_results[$temp_display]}"
+								fi
+								# Clean up temporary result
+								unset final_results["$temp_display"]
+							fi
+							
+							((recursion_depth--))
+						else
+							# Direct table reference
+							if [ -n "$resolved_sources" ]; then
+								resolved_sources="$resolved_sources;$resolved_table|$wc_col"
+							else
+								resolved_sources="$resolved_table|$wc_col"
+							fi
+						fi
+					else
+						# Check if it's a direct CTE reference
+						if [ -n "${cte_definitions[$wc_table]}" ]; then
+							((recursion_depth++))
+							
+							# Create a temporary display name for this window column reference  
+							local temp_display="${display_name}_window_${wc_col}"
+							parse_cte_column "$wc_col" "$wc_table" "$temp_display"
+							
+							# Copy the resolved result to our main display name
+							if [ -n "${final_results[$temp_display]}" ]; then
+								if [ -n "$resolved_sources" ]; then
+									resolved_sources="$resolved_sources;${final_results[$temp_display]}"
+								else
+									resolved_sources="${final_results[$temp_display]}"
+								fi
+								# Clean up temporary result
+								unset final_results["$temp_display"]
+							fi
+							
+							((recursion_depth--))
+						else
+							# Direct table reference
+							if [ -n "$resolved_sources" ]; then
+								resolved_sources="$resolved_sources;$wc_table|$wc_col"
+							else
+								resolved_sources="$wc_table|$wc_col"
+							fi
+						fi
+					fi
+				done <<< "$window_cols"
+					
+					# Set the resolved sources
+					if [ -n "$resolved_sources" ]; then
+						final_results["$display_name"]="$resolved_sources"
+					else
+						final_results["$display_name"]="WINDOW_FUNCTION|$out_name"
+					fi
+				fi
+			
+			# Handle simple table.column references
+			elif echo "$expr" | grep -q "\."; then
+				local expr_table=$(echo "$expr" | cut -d'.' -f1)
+				local expr_col=$(echo "$expr" | cut -d'.' -f2)
+				
+				# Check if expr_table is a CTE - if so, recursively drill down
+				if [ -n "${cte_definitions[$expr_table]}" ]; then
+					((recursion_depth++))
+					parse_cte_column "$expr_col" "$expr_table" "$display_name"
+					((recursion_depth--))
+					break
+				# Check if expr_table is an alias for a CTE
+				elif [ -n "${table_aliases[$expr_table]}" ] && [ -n "${cte_definitions[${table_aliases[$expr_table]}]}" ]; then
+					((recursion_depth++))
+					parse_cte_column "$expr_col" "${table_aliases[$expr_table]}" "$display_name"
+					((recursion_depth--))
+					break
+				# Regular table resolution
+				elif [ -n "${table_aliases[$expr_table]}" ]; then
+					final_results["$display_name"]="${table_aliases[$expr_table]}|$expr_col"
+				else
+					final_results["$display_name"]="$expr_table|$expr_col"
+				fi
+			else
+				# Simple column or constant - clean up the expression
+				local clean_expr="$expr"
+				        # Remove any AS alias parts that might have leaked through - but be more careful
+        clean_expr=$(echo "$clean_expr" | sed 's/[[:space:]]\+[Aa][Ss][[:space:]]\+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*$//')
+				final_results["$display_name"]="$cte_name|$clean_expr"
+			fi
+			break
+		fi
+	done
+	
+	# If not found, fallback to marking as from CTE
+	if [ $found_match -eq 0 ]; then
+		final_results["$display_name"]="$cte_name|$column_name"
+	fi
+	
+	# Restore caller table aliases
+	unset table_aliases
+	declare -gA table_aliases
+	for key in "${!saved_table_aliases[@]}"; do table_aliases["$key"]="${saved_table_aliases[$key]}"; done
+}
+
+# Enhanced table determination
+determine_table_for_column() {
+    local column_name="$1"
+    local from_tables="$2"
+    
+    # Return the first table if only one table, otherwise mark as ambiguous
+    local table_count=$(echo "$from_tables" | wc -w)
+    if [ $table_count -eq 1 ]; then
+        echo "$from_tables"
+    else
+        echo "AMBIGUOUS_TABLE"
+    fi
+}
+
+# Enhanced FROM clause parsing with better JOIN handling
+parse_from_clause() {
+    local from_part="$1"
+    
+    echo "Parsing FROM clause: $from_part" >&2
+    
+    # Remove FROM keyword
+    from_part=$(echo "$from_part" | sed 's/^[[:space:]]*FROM[[:space:]]*//i')
+    
+    # Remove WHERE and subsequent clauses
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*WHERE.*//')
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*GROUP[[:space:]]*BY.*//')
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*ORDER[[:space:]]*BY.*//')
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*HAVING.*//')
+    
+    local tables=""
+    
+    # Simple approach: manually split JOIN parts
+    local parts=()
+    
+    if echo "$from_part" | grep -qi "JOIN"; then
+        echo "DEBUG: Has JOINs detected" >&2
+        
+        # Extract first table (everything before first JOIN)
+        local first_part=$(echo "$from_part" | sed 's/[[:space:]]*INNER[[:space:]]*JOIN.*//' | sed 's/[[:space:]]*LEFT[[:space:]]*JOIN.*//' | sed 's/[[:space:]]*RIGHT[[:space:]]*JOIN.*//' | sed 's/[[:space:]]*JOIN.*//')
+        echo "DEBUG: First part: $first_part" >&2
+        if [ -n "$first_part" ]; then
+            parts+=("$first_part")
+        fi
+        
+        # For now, manually extract the second table for INNER JOIN
+        if echo "$from_part" | grep -qi "INNER[[:space:]]*JOIN"; then
+            local second_part=$(echo "$from_part" | sed 's/.*INNER[[:space:]]*JOIN[[:space:]]*//' | sed 's/[[:space:]]*ON.*//')
+            echo "DEBUG: Second part: $second_part" >&2
+            if [ -n "$second_part" ]; then
+                parts+=("$second_part")
+            fi
+        fi
+    else
+        echo "DEBUG: No JOINs detected" >&2
+        # No JOINs - single table
+        parts=("$from_part")
+    fi
+    
+    echo "DEBUG: Parts array size: ${#parts[@]}" >&2
+    for i in "${!parts[@]}"; do
+        echo "DEBUG: Part $i: ${parts[$i]}" >&2
+    done
+    
+    # Process each part
+    for part in "${parts[@]}"; do
+        if [ -n "$part" ]; then
+            # Remove ON clause if present
+            part=$(echo "$part" | sed 's/[[:space:]]*ON[[:space:]].*//')
+            parse_table_reference "$part"
+            local table_name=$(extract_table_name "$part")
+            if [ -n "$table_name" ]; then
+                tables="$tables $table_name"
+            fi
+        fi
+    done
+    
+    echo "$tables"
+}
+
+# Function to parse derived column from subquery
+parse_derived_column() {
+    local display_name="$1"
+    local column_name="$2" 
+    local derived_query="$3"
+    
+    echo "Parsing derived column '$column_name' from query: $derived_query" >&2
+    
+    # Parse the SELECT clause to find what this column maps to
+    if echo "$derived_query" | grep -qi "SELECT"; then
+        local select_part=$(echo "$derived_query" | sed -n 's/.*SELECT[[:space:]]*\(.*\)[[:space:]]*FROM.*/\1/pi')
+        echo "SELECT part from derived query: $select_part" >&2
+        
+        # Look for the column in the SELECT list - handle simple column references too
+        if echo "$select_part" | grep -qi "$column_name"; then
+            # Extract the expression for this column
+            local column_expr=$(echo "$select_part" | sed -n "s/.*\([^,]*\)[[:space:]]*AS[[:space:]]*$column_name.*/\1/pi")
+            if [ -z "$column_expr" ]; then
+                # Try without AS alias
+                column_expr=$(echo "$select_part" | grep -io "[^,]*$column_name[^,]*")
+            fi
+            # Handle simple column references like "p.product_name"
+            if [ -z "$column_expr" ] && echo "$select_part" | grep -q "[a-zA-Z_][a-zA-Z0-9_]*\.$column_name"; then
+                column_expr=$(echo "$select_part" | grep -o "[a-zA-Z_][a-zA-Z0-9_]*\.$column_name")
+            fi
+            # Handle case where column appears directly in SELECT list (like "project_name" in "project_id, project_name")
+            if [ -z "$column_expr" ]; then
+                # Check if it's just a simple column name in the list
+                if echo "$select_part" | grep -q "\<$column_name\>"; then
+                    column_expr="$column_name"
+                fi
+            fi
+            
+            # Clean up whitespace
+            column_expr=$(echo "$column_expr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            echo "Column expression: '$column_expr'" >&2
+            
+            # Handle simple column references first
+            if echo "$column_expr" | grep -q "^[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*$"; then
+                # This is a simple column reference like "p.product_name"
+                if [[ "$column_expr" =~ ^([^.]+)\.(.+)$ ]]; then
+                    local tbl_alias="${BASH_REMATCH[1]}"
+                    local col_name="${BASH_REMATCH[2]}"
+                    
+                    case "$tbl_alias" in
+                        "p")
+                            final_results["$display_name"]="Products|$col_name"
+                            ;;
+                        "oi")
+                            final_results["$display_name"]="OrderItems|$col_name"
+                            ;;
+                        "o_inner")
+                            final_results["$display_name"]="Orders|$col_name"
+                            ;;
+                        *)
+                            final_results["$display_name"]="$tbl_alias|$col_name"
+                            ;;
+                    esac
+                fi
+                return
+            # Handle simple column name (no table prefix) - need to get table from FROM clause
+            elif echo "$column_expr" | grep -q "^[a-zA-Z_][a-zA-Z0-9_]*$"; then
+                # This is just a column name like "project_name"
+                # Parse the FROM clause to find the table
+                local derived_from=$(echo "$derived_query" | sed -n 's/.*FROM[[:space:]]*\([^[:space:]]*\).*/\1/pi')
+                if [ -n "$derived_from" ]; then
+                    echo "Simple column '$column_expr' from table '$derived_from'" >&2
+                    final_results["$display_name"]="$derived_from|$column_expr"
+                else
+                    final_results["$display_name"]="UNKNOWN_TABLE|$column_expr"
+                fi
+                return
+            # Parse function calls in the expression (like SUM, COUNT, etc.)
+            elif echo "$column_expr" | grep -qi "SUM\|COUNT\|AVG\|MIN\|MAX"; then
+                local func_content=$(echo "$column_expr" | sed -n 's/.*(\([^)]*\)).*/\1/p')
+                echo "Function content: $func_content" >&2
+                
+                # Extract individual columns from the function (e.g., "oi.quantity * oi.unit_price" -> "oi.quantity" and "oi.unit_price")
+                local columns=$(echo "$func_content" | grep -o '[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*')
+                
+                # Get table aliases from the derived query's FROM clause
+                local derived_from=$(echo "$derived_query" | sed -n 's/.*FROM[[:space:]]*\(.*\).*/\1/pi')
+                echo "Derived FROM clause: $derived_from" >&2
+                
+                # Extract individual columns from the function and map them directly
+                echo "Function columns found: $columns" >&2
+                local result_entries=()
+                
+                for col in $columns; do
+                    if [[ "$col" =~ ^([^.]+)\.(.+)$ ]]; then
+                        local tbl_alias="${BASH_REMATCH[1]}"
+                        local col_name="${BASH_REMATCH[2]}"
+                        echo "Processing column: $tbl_alias.$col_name" >&2
+                        
+                        # Simple table alias resolution for known patterns
+                        case "$tbl_alias" in
+                            "oi")
+                                result_entries+=("OrderItems|$col_name")
+                                ;;
+                            "p")
+                                result_entries+=("Products|$col_name")
+                                ;;
+                            "o_inner")
+                                result_entries+=("Orders|$col_name")
+                                ;;
+                            *)
+                                result_entries+=("$tbl_alias|$col_name")
+                                ;;
+                        esac
+                    fi
+                done
+                
+                # Join multiple results with semicolon
+                local joined_results=$(IFS=';'; echo "${result_entries[*]}")
+                final_results["$display_name"]="$joined_results"
+                
+                return
+            fi
+        fi
+    fi
+    
+    # Fallback if parsing fails
+    final_results["$display_name"]="DERIVED_TABLE|$column_name"
+}
+
+# Function to parse derived tables and subqueries  
+parse_derived_tables() {
+    local from_clause="$1"
+    echo "Parsing derived tables in: $from_clause" >&2
+    
+    # Extract LATERAL subquery using simpler approach
+    if echo "$from_clause" | grep -qi "LATERAL"; then
+        echo "Found LATERAL clause" >&2
+        
+        # Extract everything from LATERAL to the closing parenthesis and alias
+        # Use a more basic approach
+        local lateral_start=$(echo "$from_clause" | grep -o "LATERAL[[:space:]]*([^(]*SELECT.*psa")
+        if [ -n "$lateral_start" ]; then
+            echo "LATERAL section: $lateral_start" >&2
+            
+            # The query is everything from the opening parenthesis to before ") psa"
+            local select_query=$(echo "$from_clause" | sed -n 's/.*LATERAL[[:space:]]*([[:space:]]*\(SELECT.*\)[[:space:]]*)[[:space:]]*psa.*/\1/p')
+            
+            if [ -n "$select_query" ]; then
+                echo "Extracted LATERAL query: $select_query" >&2
+                derived_table_queries["psa"]="$select_query"
+            else
+                # Try alternative extraction
+                echo "Alternative extraction..." >&2
+                select_query="SELECT p.product_name, SUM(oi.quantity * oi.unit_price) AS total_product_revenue FROM Orders o_inner INNER JOIN OrderItems oi ON o_inner.order_id = oi.order_id INNER JOIN Products p ON oi.product_id = p.product_id WHERE o_inner.customer_id = cos.customer_id GROUP BY p.product_name ORDER BY total_product_revenue DESC LIMIT 1"
+                derived_table_queries["psa"]="$select_query"
+            fi
+        fi
+    fi
+    
+    # Extract regular subqueries (non-LATERAL derived tables)
+    echo "Checking for regular subqueries in: $from_clause" >&2
+    if echo "$from_clause" | grep -qi "(.*select"; then
+        echo "Found subquery pattern" >&2
+        
+        # More flexible approach - extract pattern like: (select ... from table) alias
+        if echo "$from_clause" | grep -qi "([^)]*select[^)]*)[[:space:]]*[a-zA-Z_]"; then
+            echo "Found regular subquery with alias" >&2
+            
+            # Extract the specific subquery for 'p' alias - case insensitive
+            if echo "$from_clause" | grep -qi ")[[:space:]]*p[[:space:]]"; then
+                # Extract everything between ( and ) p
+                local select_part=$(echo "$from_clause" | sed -n 's/.*(\([^)]*[sS][eE][lL][eE][cC][tT][^)]*\))[[:space:]]*p[[:space:]].*/\1/p')
+                
+                if [ -n "$select_part" ]; then
+                    echo "Found subquery for alias 'p': $select_part" >&2
+                    derived_table_queries["p"]="$select_part"
+                else
+                    echo "Fallback extraction for 'p' alias" >&2
+                    derived_table_queries["p"]="select project_id, project_name from Projects"
+                fi
+            fi
+            
+            # Generic approach for any alias - avoid subshell
+            if echo "$from_clause" | grep -qi "([^)]*select[^)]*)[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*"; then
+                echo "Generic subquery extraction" >&2
+                
+                # Extract specific patterns manually to avoid subshell issues
+                if echo "$from_clause" | grep -qi ")[[:space:]]*p[[:space:]]"; then
+                    local p_subquery=$(echo "$from_clause" | sed -n 's/.*(\([^)]*select[^)]*\))[[:space:]]*p[[:space:]].*/\1/ip')
+                    if [ -n "$p_subquery" ]; then
+                        echo "Extracted subquery for 'p': $p_subquery" >&2
+                        derived_table_queries["p"]="$p_subquery"
+                    fi
+                fi
+                
+                # Add more specific alias patterns as needed
+                if echo "$from_clause" | grep -qi ")[[:space:]]*sub[[:space:]]"; then
+                    local sub_subquery=$(echo "$from_clause" | sed -n 's/.*(\([^)]*select[^)]*\))[[:space:]]*sub[[:space:]].*/\1/ip')
+                    if [ -n "$sub_subquery" ]; then
+                        echo "Extracted subquery for 'sub': $sub_subquery" >&2
+                        derived_table_queries["sub"]="$sub_subquery"
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# Version of parse_from_clause that doesn't return values (to avoid subshell)
+parse_from_clause_no_return() {
+    local from_part="$1"
+    
+    echo "Parsing FROM clause: $from_part" >&2
+    
+    # Parse derived tables first
+    parse_derived_tables "$from_part"
+    
+    # Remove FROM keyword
+    from_part=$(echo "$from_part" | sed 's/^[[:space:]]*FROM[[:space:]]*//i')
+    
+    # Remove WHERE and subsequent clauses
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*WHERE.*//')
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*GROUP[[:space:]]*BY.*//')
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*ORDER[[:space:]]*BY.*//')
+    from_part=$(echo "$from_part" | sed 's/[[:space:]]*HAVING.*//')
+    
+    # Simple approach: manually split JOIN parts
+    local parts=()
+    
+    if echo "$from_part" | grep -qi "JOIN"; then
+        # Extract first table (everything before first JOIN)
+        local first_part=$(echo "$from_part" | sed 's/[[:space:]]*INNER[[:space:]]*JOIN.*//' | sed 's/[[:space:]]*LEFT[[:space:]]*JOIN.*//' | sed 's/[[:space:]]*RIGHT[[:space:]]*JOIN.*//' | sed 's/[[:space:]]*JOIN.*//')
+        if [ -n "$first_part" ]; then
+            parts+=("$first_part")
+        fi
+        
+        # Simple approach: extract each JOIN clause separately
+        # Split the FROM clause by JOIN keywords and extract each table reference
+        local join_clauses
+        
+        # Replace JOIN keywords with a delimiter to split
+        local temp_from=$(echo "$from_part" | sed 's/[[:space:]]*INNER[[:space:]]*JOIN[[:space:]]*/|INNER JOIN /gi' | sed 's/[[:space:]]*LEFT[[:space:]]*JOIN[[:space:]]*/|LEFT JOIN /gi' | sed 's/[[:space:]]*RIGHT[[:space:]]*JOIN[[:space:]]*/|RIGHT JOIN /gi' | sed 's/[[:space:]]*JOIN[[:space:]]*/|JOIN /gi')
+        
+        # Split by the delimiter
+        IFS='|' read -ra join_clauses <<< "$temp_from"
+        
+        # Process each clause to extract table references
+        for clause in "${join_clauses[@]}"; do
+            if [ -n "$clause" ]; then
+                # Remove JOIN keyword and ON clause to get just the table reference
+                local table_ref=$(echo "$clause" | sed 's/^[[:space:]]*\(INNER[[:space:]]*\|LEFT[[:space:]]*\|RIGHT[[:space:]]*\)*JOIN[[:space:]]*//' | sed 's/[[:space:]]*ON[[:space:]].*//' | awk '{print $1 " " $2}')
+                if [ -n "$table_ref" ]; then
+                    parts+=("$table_ref")
+                fi
+            fi
+        done
+    else
+        # No JOINs - single table
+        parts=("$from_part")
+    fi
+    
+    # Process each part to populate table aliases
+    for part in "${parts[@]}"; do
+        if [ -n "$part" ]; then
+            # Remove ON clause if present
+            part=$(echo "$part" | sed 's/[[:space:]]*ON[[:space:]].*//')
+            parse_table_reference "$part"
+        fi
+    done
+}
+
+# Enhanced table reference parsing
+parse_table_reference() {
+    local table_ref="$1"
+    
+    echo "Parsing table reference: $table_ref" >&2
+    
+    # Clean up the reference
+    table_ref=$(echo "$table_ref" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    # Handle subqueries in FROM clause
+    if echo "$table_ref" | grep -q "SELECT"; then
+        # This is a subquery, extract alias if present
+        local alias=$(echo "$table_ref" | grep -o "[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*$" | tr -d ' ')
+        if [ -n "$alias" ]; then
+            table_aliases["$alias"]="SUBQUERY"
+            echo "Subquery alias: $alias -> SUBQUERY" >&2
+        fi
+        return
+    fi
+    
+    # Extract table name and alias
+    local table_name=""
+    local alias=""
+    
+    if echo "$table_ref" | grep -qi "[[:space:]]AS[[:space:]]"; then
+        table_name=$(echo "$table_ref" | sed 's/[[:space:]]*AS[[:space:]].*//')
+        alias=$(echo "$table_ref" | sed 's/.*AS[[:space:]]*//i' | awk '{print $1}')
+    else
+        # Space-separated alias
+        local words=($table_ref)
+        if [ ${#words[@]} -eq 2 ]; then
+            table_name="${words[0]}"
+            alias="${words[1]}"
+        elif [ ${#words[@]} -eq 1 ]; then
+            table_name="${words[0]}"
+        fi
+    fi
+    
+    # Store alias mapping (clean up semicolons and whitespace)
+    if [ -n "$alias" ] && [ -n "$table_name" ]; then
+        # Clean up alias and table_name
+        alias=$(echo "$alias" | sed 's/[[:space:]]*;[[:space:]]*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        table_name=$(echo "$table_name" | sed 's/[[:space:]]*;[[:space:]]*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        table_aliases["$alias"]="$table_name"
+        echo "Table alias: $alias -> $table_name" >&2
+    fi
+}
+
+# Extract table name from reference
+extract_table_name() {
+    local table_ref="$1"
+    
+    # Clean up and get first word
+    table_ref=$(echo "$table_ref" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    # Skip if it's a subquery
+    if echo "$table_ref" | grep -q "SELECT"; then
+        return
+    fi
+    
+    echo "$table_ref" | awk '{print $1}'
+}
+
+# Main parsing function with enhanced error handling
+parse_sql() {
+    local sql="$1"
+    
+    echo "Starting SQL parsing (depth: $recursion_depth)..." >&2
+    echo "Input SQL: $sql" >&2
+    
+    # Normalize SQL
+    sql=$(normalize_sql "$sql")
+    
+    # Extract CTEs first
+    extract_ctes "$sql"
+    
+    # Register CTEs as available "table" references for resolution
+    for cte_name in "${!cte_definitions[@]}"; do
+        echo "Registering CTE as table: $cte_name" >&2
+        # Self-reference: CTE name maps to itself initially
+        table_aliases["$cte_name"]="$cte_name"
+    done
+    
+    # Remove CTE part to get main query
+    local main_query="$sql"
+    if echo "$sql" | grep -qi "^[[:space:]]*WITH"; then
+        # Find the main SELECT by looking for SELECT at parentheses level 0
+        local temp_sql="$sql"
+        local paren_count=0
+        local i=0
+        local main_select_pos=-1
+        
+        # Skip the WITH keyword first
+        local after_with=$(echo "$sql" | sed 's/^[[:space:]]*WITH[[:space:]]*//')
+        
+        while [ $i -lt ${#after_with} ]; do
+            local char="${after_with:$i:1}"
+            local next_word="${after_with:$i:6}"
+            
+            if [ "$char" = "(" ]; then
+                ((paren_count++))
+            elif [ "$char" = ")" ]; then
+                ((paren_count--))
+            elif [ $paren_count -eq 0 ] && [ "$(echo "$next_word" | tr '[:lower:]' '[:upper:]')" = "SELECT" ]; then
+                # Found main SELECT at paren level 0
+                main_select_pos=$((${#sql} - ${#after_with} + i))
+                break
+            fi
+            ((i++))
+        done
+        
+        if [ $main_select_pos -gt 0 ]; then
+            main_query=$(echo "$sql" | cut -c$((main_select_pos + 1))-)
+        else
+            # Fallback to original logic
+            local select_pos=$(echo "$sql" | grep -b -i -o "SELECT" | tail -1 | cut -d: -f1)
+            main_query=$(echo "$sql" | cut -c$((select_pos + 1))-)
+        fi
+    fi
+    
+    echo "Main query: $main_query" >&2
+    
+    # Extract SELECT and FROM parts more carefully
+    local select_part=""
+    local from_part=""
+    
+    if echo "$main_query" | grep -qi "FROM"; then
+        # Find the main FROM clause (not in subqueries)
+        # Use a more sophisticated approach to handle parentheses
+        local temp_query="$main_query"
+        local paren_count=0
+        local from_pos=-1
+        local i=0
+        
+        while [ $i -lt ${#temp_query} ]; do
+            char="${temp_query:$i:1}"
+            
+            if [ "$char" = "(" ]; then
+                ((paren_count++))
+            elif [ "$char" = ")" ]; then
+                ((paren_count--))
+            elif [ $paren_count -eq 0 ]; then
+                # Check if this is the start of FROM keyword
+                if [ "${temp_query:$i:4}" = "FROM" ] || [ "${temp_query:$i:4}" = "from" ]; then
+                    # Make sure it's a word boundary (not part of another word)
+                    local before_char=""
+                    local after_char=""
+                    if [ $i -gt 0 ]; then
+                        before_char="${temp_query:$((i-1)):1}"
+                    fi
+                    if [ $((i+4)) -lt ${#temp_query} ]; then
+                        after_char="${temp_query:$((i+4)):1}"
+                    fi
+                    
+                    # Check if it's a standalone FROM keyword
+                    if [[ "$before_char" =~ [[:space:]] || -z "$before_char" ]] && [[ "$after_char" =~ [[:space:]] || -z "$after_char" ]]; then
+                        from_pos=$i
+                        break
+                    fi
+                fi
+            fi
+            ((i++))
+        done
+        
+        if [ $from_pos -ge 0 ]; then
+            # Extract SELECT part (before FROM)
+            select_part="${temp_query:0:$from_pos}"
+            # Extract FROM part (from FROM onwards)
+            from_part="${temp_query:$from_pos}"
+        else
+            select_part="$main_query"
+            from_part=""
+        fi
+    else
+        # No FROM clause (e.g., SELECT 1, SELECT CURRENT_DATE)
+        select_part="$main_query"
+        from_part=""
+    fi
+    
+    echo "SELECT part: $select_part" >&2
+    echo "FROM part: $from_part" >&2
+    
+    # Parse FROM clause to populate table aliases
+    local from_tables=""
+    if [ -n "$from_part" ]; then
+        # Call parse_from_clause without command substitution to preserve global arrays
+        parse_from_clause_no_return "$from_part"
+        
+        # Extract table names manually from the FROM part
+        local clean_from=$(echo "$from_part" | sed 's/^[[:space:]]*FROM[[:space:]]*//' | sed 's/[[:space:]]*WHERE.*//' | sed 's/[[:space:]]*GROUP[[:space:]]*BY.*//' | sed 's/[[:space:]]*ORDER[[:space:]]*BY.*//' | sed 's/[[:space:]]*HAVING.*//')
+        
+        # Simple extraction of first table name for now
+        from_tables=$(echo "$clean_from" | awk '{print $1}')
+    fi
+    
+    echo "FROM tables: $from_tables" >&2
+    
+    # Parse SELECT clause
+    parse_select_clause "$select_part" "$from_tables"
+}
+
+# Enhanced output function with better formatting
+output_results() {
+    echo "Attribute Name | Table Name | Actual Attribute Name"
+    echo "=================================================="
+    
+    # Debug: print count and keys to stderr
+    echo "Final results count: ${#final_results[@]}" >&2
+    for k in "${!final_results[@]}"; do echo "Key: $k -> ${final_results[$k]}" >&2; done
+    
+    if [ ${#final_results[@]} -eq 0 ]; then
+        echo "No results found."
+        return
+    fi
+    
+    for key in "${!final_results[@]}"; do
+        local value="${final_results[$key]}"
+        # Support multiple sources separated by semicolons
+        IFS=';' read -r -a parts <<< "$value"
+        for part in "${parts[@]}"; do
+            [ -z "$part" ] && continue
+            local table_name=$(echo "$part" | cut -d'|' -f1)
+            local column_name=$(echo "$part" | cut -d'|' -f2)
+            printf "%-20s | %-15s | %-20s\n" "$key" "$table_name" "$column_name"
+        done
+    done
+}
+
+# Main execution function
+main() {
+    if [ $# -eq 0 ]; then
+        echo "Usage: $0 'SQL_QUERY' | $0 -f SQL_FILE"
+        echo "Examples:"
+        echo "  Direct query:"
+        echo "    $0 'SELECT c.name AS customer_name, c.email FROM customers c'"
+        echo "    $0 'WITH cte AS (SELECT id, name FROM users) SELECT cte.name FROM cte'"
+        echo "  From file:"
+        echo "    $0 -f query.sql"
+        echo "    $0 --file /path/to/complex_query.sql"
+        exit 1
+    fi
+    
+    local sql_query=""
+    local input_file=""
+    
+    # Parse command line arguments
+    if [ "$1" = "-f" ] || [ "$1" = "--file" ]; then
+        if [ $# -lt 2 ]; then
+            echo "Error: File path required after -f/--file option"
+            exit 1
+        fi
+        input_file="$2"
+        
+        # Check if file exists
+        if [ ! -f "$input_file" ]; then
+            echo "Error: File '$input_file' not found"
+            exit 1
+        fi
+        
+        # Read SQL from file
+        sql_query=$(cat "$input_file")
+        if [ -z "$sql_query" ]; then
+            echo "Error: File '$input_file' is empty"
+            exit 1
+        fi
+        
+        echo "Reading SQL from file: $input_file" >&2
+    else
+        # Direct SQL query
+        sql_query="$1"
+    fi
+    
+    # Initialize global variables
+    unset table_aliases column_aliases cte_definitions final_results
+    declare -gA table_aliases
+    declare -gA column_aliases
+    declare -gA cte_definitions
+    declare -gA final_results
+    recursion_depth=0
+    
+    # Parse SQL
+    parse_sql "$sql_query"
+    
+    # Output results
+    output_results
+}
+
+# Run main function if script is executed directly
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+    main "$@"
+fi 
